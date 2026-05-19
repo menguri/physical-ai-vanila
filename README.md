@@ -12,6 +12,16 @@
 
 ## 0. 한눈에 보는 데모
 
+### 🤖 실제 xArm6에서 동작 (Sim-to-Real)
+
+MuJoCo 시뮬에서만 학습한 PPO 정책을 **실제 UFactory xArm6**에 그대로 배포한 모습:
+
+![xArm6 real](outputs/gif/xarm-real-ppo.gif)
+
+학습은 시뮬에서, 배포는 실제 로봇에. 정책 코드/가중치는 한 줄도 수정하지 않음.
+
+### 🖥️ 시뮬 데모 (9-point Grid Tour)
+
 학습된 정책이 **Safe zone 안의 9개 점을 순서대로 찍고 home으로 복귀** 하는 모습 (시뮬, 9/9 모두 도달).
 
 | PPO (no DR) | PPO + DR | SAC + DR |
