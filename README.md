@@ -21,6 +21,12 @@
    + safe penalty
 ```
 
+### 🎬 데모: 9-point Grid Tour (PPO baseline, 9/9 도달)
+
+![grid tour](outputs/gif/ppo_v2_grid_tour_small.gif)
+
+Safe zone 안에 균일한 3×3 격자(9개 target)를 정의해, 정책이 한 점씩 reach 후 home 복귀를 반복합니다. 빨강=현재 target, 초록=완료, 회색=대기. 자세한 실행 방법은 [§6.4](#64-9-point-grid-tour-데모-시각화).
+
 ---
 
 ## 1. 레포 구조
@@ -48,6 +54,11 @@ xArm-project/
 │   └── deploy_real.py         # 실제 xArm6 배포 (XArmAPI)
 ├── outputs/                   # 학습 산출물 (.gitignore)
 │   ├── report.md              # 학습 결과 요약 (성공 조합 + 비교)
+│   ├── gif/                   # 데모 / rollout GIF 모음 (README 임베드)
+│   │   ├── ppo_v2_grid_tour.gif        (19 MB, 640x480, 풀버전)
+│   │   ├── ppo_v2_grid_tour_small.gif  (7.2 MB, 480x360, README용)
+│   │   ├── ppo_v2_rollout.gif          (3 episode rollout)
+│   │   └── sac_v3_rollout_best.gif
 │   ├── reach_ppo_v2/          # PPO baseline (DR 없음) - 86%
 │   ├── reach_sac_v3/          # SAC baseline (DR 없음) - 86%
 │   ├── reach_ppo_dr/          # PPO + DR (sim-to-real용 권장)
@@ -205,16 +216,62 @@ python scripts/eval_headless.py --task reach --algo ppo \
 - (1) 다른 체크포인트 평가 (`ckpts/*.zip` 중 best 선택 — SAC는 진동이 있어 final이 best가 아닐 수 있음)
 - (2) seed/timesteps 조정해 재학습
 
-### 6.4 GIF 만들기 (헤드리스 OK)
+### 6.4 9-point Grid Tour 데모 (시각화)
+
+학습된 정책의 정확도/일관성을 한눈에 보기 위해 **safe zone 안에 3×3 = 9개 균일 격자 점**을 정의하고, `home → P0 → home → P1 → … → P8 → home` 순서로 한 점씩 reach + 복귀를 반복하는 데모 GIF를 만듭니다. 매 segment마다 환경을 home으로 리셋해 학습 분포에 맞춥니다.
+
 ```bash
+python scripts/demo_grid_tour.py --algo ppo \
+    --model outputs/reach_ppo_v2/final_model.zip \
+    --out outputs/gif/ppo_v2_grid_tour.gif
+```
+
+9개 점 좌표 (단위 m, base frame):
+```
+GRID_X = [0.32, 0.42, 0.52]
+GRID_Y = [-0.20, 0.00, 0.20]
+GRID_Z = 0.45    (고정 평면)
+```
+
+GIF 시각 요소:
+- 🔴 빨강 = 현재 활성 target
+- 🟢 초록 = 이미 다녀온 점
+- ⚫ 회색 = 아직 안 간 점
+
+크기 조절: `--width 480 --height 360 --render_every 4` 로 작게 (7 MB), 기본 640×480·every=2 면 19 MB.
+
+PPO v2 baseline (86% success) 결과: **9/9 점 모두 도달**
+
+![grid tour](outputs/gif/ppo_v2_grid_tour_small.gif)
+
+> ❓ **왜 처음엔 1/9 만 됐다가 수정 후 9/9?**
+> 처음 데모는 한 점 reach 후 환경을 reset하지 않고 다음 target만 바꿔서, 정책이 학습 시 본 적 없는 state(home에서 멀리 떨어진 자세)에 빠지면서 out-of-distribution이 됐습니다. 정책은 "home 근처 시작 → 임의 target" 분포로만 학습됐기 때문이죠. 수정 후엔 매 segment 시작 시 `env.reset()` 으로 home 복귀 → 학습 분포 일치 → 9/9 성공.
+> (실제 배포에서도 매 reach 사이클을 home 근처에서 시작하면 가장 안정적입니다.)
+
+### 6.5 단일 에피소드 GIF 만들기 (헤드리스 OK)
+
+랜덤 target 3 에피소드를 rollout하여 짧은 GIF를 생성합니다 — 일반적인 성공률/실패 케이스 보기용.
+```bash
+# PPO baseline
 python scripts/render_gif.py --task reach --algo ppo \
-    --model outputs/reach_ppo_dr/final_model.zip \
-    --out outputs/reach_ppo_dr/rollout.gif \
+    --model outputs/reach_ppo_v2/final_model.zip \
+    --out outputs/gif/ppo_v2_rollout.gif \
     --episodes 3 --width 480 --height 360 --fps 30
+
+# SAC baseline best
+python scripts/render_gif.py --task reach --algo sac \
+    --model outputs/reach_sac_v3/best_model.zip \
+    --out outputs/gif/sac_v3_rollout_best.gif --episodes 3
 ```
 MuJoCo EGL backend로 GPU 디스플레이 없이 렌더링됩니다.
 
-### 6.5 하이퍼파라미터 요약 (이미 코드에 반영)
+샘플 결과 (3 에피소드 각각):
+
+| PPO v2 (86%) | SAC v3 best (86%) |
+|---|---|
+| ![ppo](outputs/gif/ppo_v2_rollout.gif) | ![sac](outputs/gif/sac_v3_rollout_best.gif) |
+
+### 6.6 하이퍼파라미터 요약 (이미 코드에 반영)
 
 | | PPO (in `build_ppo()`) | SAC (in `build_sac()`) |
 |---|---|---|
@@ -268,7 +325,31 @@ python scripts/deploy_real.py --task reach \
 ```
 출력에서 매 step `q=[..] a=[..] ee=[..]` 가 합리적인 범위로 변하면 OK.
 
-### 7.4 실제 동작 — 보수적 시작 (15분)
+### 7.4 9-point Grid Tour 실제 배포 ⭐
+
+시뮬에서 9/9 성공한 그 데모 시퀀스를 **실제 xArm6**에서 실행합니다. 한 명령으로 home → P0 → home → P1 → … → P8 → home 순서로 자동 순회합니다.
+
+```bash
+# Dry-run (실제 모터 X, 스크립트/safe-zone 가드 sanity만 확인)
+python scripts/deploy_grid_tour.py \
+    --model outputs/reach_ppo_v2/final_model.zip \
+    --ip 192.168.1.185 --dry-run
+
+# 실제 동작 — 30% 속도부터
+python scripts/deploy_grid_tour.py \
+    --model outputs/reach_ppo_v2/final_model.zip \
+    --ip 192.168.1.185 --speed 30 --hz 20 --dwell 1.0
+```
+
+특징:
+- 9개 grid point 좌표가 [scripts/demo_grid_tour.py](scripts/demo_grid_tour.py)와 **완전히 일치** (시뮬-실제 1:1)
+- 매 target 사이마다 **home 자세 복귀** → 학습 분포 일치 → §6.4의 박스 설명 참고
+- 매 step **safe-zone hard guard**: TCP가 safe box 밖이면 즉시 segment 종료
+- `--dwell` 옵션: 각 target 도달 후 잠깐 대기 (시각 확인용)
+
+> ⚠️ **dry-run 한계**: FakeArm에는 진짜 forward kinematics가 없어 TCP가 시뮬처럼 안 움직입니다. dry-run의 목적은 "스크립트가 끝까지 도는가" + "safe-zone 가드 코드 sanity" 검증입니다. 실제 success rate는 진짜 컨트롤러 연결 후에야 확인됩니다.
+
+### 7.5 단일 target 실제 동작 — 더 보수적인 시작 (15분)
 ```bash
 # 첫 시도: 30% 속도, 20Hz control
 python scripts/deploy_real.py --task reach \
