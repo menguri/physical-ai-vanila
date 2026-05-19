@@ -3,17 +3,17 @@
 Visits 9 evenly-spaced points in the safe zone, returning to a home pose between
 each. Same 3x3 layout as the simulation demo (scripts/demo_grid_tour.py).
 
+Controller default: IP 192.168.1.199, Modbus TCP port 502 (SDK uses 502 internally).
+
 USAGE (start carefully):
 
     # 1. Dry-run: prints planned actions, NO real motion
     python scripts/deploy_grid_tour.py \
-        --model outputs/reach_ppo_v2/final_model.zip \
-        --ip 192.168.1.185 --dry-run
+        --model outputs/reach_ppo_v2/final_model.zip --dry-run
 
-    # 2. Real run, conservative speed
+    # 2. Real run, conservative speed (uses default --ip 192.168.1.199)
     python scripts/deploy_grid_tour.py \
-        --model outputs/reach_ppo_v2/final_model.zip \
-        --ip 192.168.1.185 --speed 30 --hz 20
+        --model outputs/reach_ppo_v2/final_model.zip --speed 30 --hz 20
 
 SAFETY
 - E-stop must be in reach at all times.
@@ -51,9 +51,12 @@ HOME_QPOS_RAD = np.array([0.0, -0.3, -1.2, 0.0, 1.5, 0.0], dtype=np.float32)
 SAFE_LOW_M  = np.array([0.000, -0.540, 0.180], dtype=np.float32)
 SAFE_HIGH_M = np.array([0.570,  0.550, 0.600], dtype=np.float32)
 
-# Joint limits (rad) — same as env (xarm_rl/envs/base_env.py)
-JOINT_LIMITS_LOW  = np.array([-6.283, -2.059, -3.927, -6.283, -1.693, -6.283], dtype=np.float32)
-JOINT_LIMITS_HIGH = np.array([ 6.283,  2.094,  0.191,  6.283,  3.142,  6.283], dtype=np.float32)
+# Joint limits (rad) — same as env (xarm_rl/envs/base_env.py).
+# Apply a small safety margin so we never command exactly at the hardware
+# boundary (controllers can reject boundary-equal targets with code=1).
+_JL_MARGIN = 0.02
+JOINT_LIMITS_LOW  = np.array([-6.283, -2.059, -3.927, -6.283, -1.693, -6.283], dtype=np.float32) + _JL_MARGIN
+JOINT_LIMITS_HIGH = np.array([ 6.283,  2.094,  0.191,  6.283,  3.142,  6.283], dtype=np.float32) - _JL_MARGIN
 
 SUCCESS_DIST = 0.03  # 3 cm
 ALGO_CLS = {"ppo": PPO, "sac": SAC}
@@ -113,6 +116,31 @@ class FakeArm:
 
 
 # -----------------------------------------------------------------------------
+def goto_joint_home(arm, args):
+    """Drive arm to HOME_QPOS_RAD via position mode, then return to servo mode.
+
+    Called once at startup AND between every target segment so each P_i begins
+    from the SAME joint configuration the policy was trained on. Necessary
+    because TCP `reached=True` (within 3cm of HOME_TARGET) does NOT imply the
+    joint configuration matches training — xArm6 has redundant joint solutions
+    for any given TCP xyz.
+    """
+    if args.dry_run:
+        arm._q = HOME_QPOS_RAD.copy()
+        arm._tcp_mm = np.array([420.0, 0.0, 550.0], dtype=np.float32)
+        return
+
+    arm.set_mode(0)
+    arm.set_state(state=0)
+    time.sleep(0.2)
+    arm.set_servo_angle(angle=HOME_QPOS_RAD.tolist(), is_radian=True,
+                        speed=args.home_speed, wait=True)
+    time.sleep(0.2)
+    arm.set_mode(1)
+    arm.set_state(state=0)
+    time.sleep(0.2)
+
+
 def build_obs(q_rad: np.ndarray, qd_rad: np.ndarray, ee_pos_m: np.ndarray,
               target_m: np.ndarray) -> np.ndarray:
     """Build the same 21-d observation the policy was trained with."""
@@ -157,7 +185,12 @@ def run_segment(arm, policy, target_xyz: np.ndarray, args, label: str) -> tuple[
         action, _ = policy.predict(obs, deterministic=True)
         action = np.clip(action, -1.0, 1.0).astype(np.float32)[:6]
 
-        target_q = np.clip(q + action * args.action_scale, JOINT_LIMITS_LOW, JOINT_LIMITS_HIGH)
+        # Per-step joint delta hard cap (SAFETY): in servo mode the SDK's
+        # `speed` arg is ignored — actual joint velocity = step_delta × hz.
+        # `--max-step-rad` lets you set an upper bound regardless of policy output.
+        step_delta = np.clip(action * args.action_scale,
+                             -args.max_step_rad, args.max_step_rad)
+        target_q = np.clip(q + step_delta, JOINT_LIMITS_LOW, JOINT_LIMITS_HIGH)
 
         if args.dry_run:
             arm.set_servo_angle_j(target_q.tolist(), is_radian=True)
@@ -192,13 +225,27 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="trained policy .zip")
     ap.add_argument("--algo", choices=list(ALGO_CLS), default="ppo")
-    ap.add_argument("--ip", required=True, help="xArm controller IP")
+    ap.add_argument("--ip", default="192.168.1.199",
+                    help="xArm controller IP (default: 192.168.1.199)")
+    ap.add_argument("--port", type=int, default=502,
+                    help="Modbus TCP port — informational only; XArmAPI uses 502 internally")
     ap.add_argument("--speed", type=int, default=30, help="0-100, xArm servo speed")
     ap.add_argument("--hz", type=float, default=20.0, help="control loop frequency")
     ap.add_argument("--max-steps", type=int, default=200,
                     help="max policy steps per segment")
     ap.add_argument("--action-scale", type=float, default=0.05,
                     help="rad/step per joint (must match training)")
+    ap.add_argument("--max-step-rad", type=float, default=0.015,
+                    help="SAFETY cap: max rad/step per joint regardless of policy. "
+                         "Effective joint speed ≈ max_step_rad × hz. "
+                         "Default 0.015 rad × 20 Hz = 0.3 rad/s (~17°/s)")
+    ap.add_argument("--home-speed", type=float, default=0.15,
+                    help="rad/s for the initial move to training HOME pose. "
+                         "Default 0.15 (~8.6°/s). RAISE ONLY AFTER FIRST SUCCESSFUL RUN.")
+    ap.add_argument("--collision-sensitivity", type=int, default=1,
+                    help="xArm collision detection sensitivity, 0..5 (higher = more sensitive). "
+                         "Default 1 (low) to avoid false triggers from current spikes during "
+                         "rapid policy commands. Raise to 3+ only when arm/load behavior is verified.")
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--dwell", type=float, default=1.0,
                     help="pause (sec) at each target before returning home")
@@ -217,33 +264,53 @@ def main():
             raise SystemExit("xArm-Python-SDK not installed. pip install xArm-Python-SDK")
         arm = XArmAPI(args.ip, is_radian=True)
         arm.motion_enable(enable=True)
-        arm.set_mode(1)            # servo motion (real-time joint streaming)
-        arm.set_state(state=0)
-        arm.set_collision_sensitivity(3)   # 0..5, higher = more sensitive
-        arm.move_gohome(wait=True)
-        time.sleep(0.5)
+        arm.set_collision_sensitivity(args.collision_sensitivity)
+        print(f"[deploy] target HOME joint pose = {HOME_QPOS_RAD}  "
+              f"(home_speed={args.home_speed} rad/s)")
+
+    # Initial home — guaranteed training joint config
+    goto_joint_home(arm, args)
+    if not args.dry_run:
+        _, q_at_home = arm.get_servo_angle(is_radian=True)
+        print(f"[deploy] arrived at q6 = {np.round(q_at_home[:6], 4)}")
 
     policy = ALGO_CLS[args.algo].load(args.model, device="auto")
 
     successes = 0
-    for i, p in enumerate(targets):
-        print(f"\n>>> Target P{i} = {p}")
-        # 1) Go to HOME (matches training distribution — see README §6.4 box)
-        run_segment(arm, policy, HOME_TARGET, args, label=f"home_before_P{i}")
-        # 2) Reach target
-        ok, _ = run_segment(arm, policy, p, args, label=f"P{i}")
-        if ok:
-            successes += 1
-        # 3) Optional dwell so an observer can see it landed
-        if args.dwell > 0:
-            time.sleep(args.dwell)
+    try:
+        for i, p in enumerate(targets):
+            print(f"\n>>> Target P{i} = {p}")
+            # 1) HARD reset to training joint home (position mode — not policy)
+            print(f"  [home_reset_P{i}] returning to HOME_QPOS_RAD via position mode")
+            goto_joint_home(arm, args)
+            # 2) Reach target with policy
+            ok, _ = run_segment(arm, policy, p, args, label=f"P{i}")
+            if ok:
+                successes += 1
+            # 3) Optional dwell so an observer can see it landed
+            if args.dwell > 0:
+                time.sleep(args.dwell)
 
-    print(f"\n>>> Returning HOME")
-    run_segment(arm, policy, HOME_TARGET, args, label="home_final")
+        print(f"\n>>> Returning HOME (final)")
+        goto_joint_home(arm, args)
 
-    print(f"\n[deploy] {successes}/{len(targets)} targets reached")
-    if not args.dry_run:
-        arm.disconnect()
+        print(f"\n[deploy] {successes}/{len(targets)} targets reached")
+    except KeyboardInterrupt:
+        print("\n[deploy] Ctrl+C — stopping cleanly")
+    except Exception as e:
+        print(f"\n[deploy] aborted on exception: {e!r}")
+        raise
+    finally:
+        if not args.dry_run:
+            try:
+                arm.set_state(state=4)   # STOP — motors disabled, brakes engage
+            except Exception:
+                pass
+            try:
+                arm.disconnect()
+            except Exception:
+                pass
+            print("[deploy] arm stopped + disconnected")
 
 
 if __name__ == "__main__":

@@ -289,11 +289,14 @@ MuJoCo EGL backend로 GPU 디스플레이 없이 렌더링됩니다.
 ## 7. 배포 프로세스 (실제 xArm6, UFactory)
 
 ### 7.0 사전 점검 (10분)
-- [ ] xArm6 컨트롤러 박스 부팅, e-stop 버튼 위치 확보
+- [ ] xArm6 컨트롤러 박스 부팅, **e-stop 버튼 손에 쥐기** (모든 실제 실행 동안)
 - [ ] xArm Studio (제조사 GUI)로 연결 → 펌웨어 최신
 - [ ] xArm Studio에서 수동 동작 (joint 각각 점프, home 이동) 확인
 - [ ] **xArm Studio → Settings → Safety**: workspace box를 `x: 0~570, y: -540~550, z: 180~600 mm`로 등록
 - [ ] **노트북에 정책 파일 복사**: 학습 머신의 `outputs/reach_ppo_dr/final_model.zip`를 노트북으로
+- [ ] 팔 주변 충돌물 제거, 반경 1m 사람 없음 확인
+
+**컨트롤러 기본 설정 (본 셋업)**: IP `192.168.1.199`, Modbus TCP 포트 `502` (XArmAPI 내부 기본). 배포 스크립트의 `--ip` 기본값으로 들어가 있어 보통은 생략 가능.
 
 ### 7.1 노트북 ↔ 컨트롤러 네트워크 (5분)
 ```bash
@@ -302,99 +305,127 @@ MuJoCo EGL backend로 GPU 디스플레이 없이 렌더링됩니다.
 sudo ip addr add 192.168.1.10/24 dev eth0       # Linux 예시
 # Windows: 네트워크 → 어댑터 설정 → IPv4 수동 192.168.1.10 / 255.255.255.0
 
-# 통신 확인 (컨트롤러 기본 IP가 보통 192.168.1.185 — 실제 IP는 본인 컨트롤러 확인)
-ping 192.168.1.185
+# 통신 확인 — 본 셋업 컨트롤러: IP 192.168.1.199, Modbus TCP 포트 502
+ping 192.168.1.199
 ```
 
 ### 7.2 노트북 환경 (10분)
 ```bash
 git clone <repo-url> xArm-project    # 또는 USB로 복사
 cd xArm-project
-python3.11 -m venv .venv
-source .venv/bin/activate
-pip install -e ".[real]"             # mujoco + sb3 + xArm-Python-SDK 한 번에
+
+# uv 사용 (Windows/Linux 공통)
+uv venv .venv --python 3.11
+
+# 활성화 — 셸별로 다름
+source .venv/bin/activate            # Linux / macOS
+source .venv/Scripts/activate        # Windows + Git Bash (MINGW64)
+# .venv\Scripts\activate             # Windows + PowerShell/cmd
+
+uv pip install -e ".[real]"          # mujoco + sb3 + xArm-Python-SDK 한 번에
 ```
 
-### 7.3 Dry-run — 정책 sanity (실제 모터 X, 5분)
+### 7.3 통신 sanity — 모터 안 움직임 (2분)
 ```bash
-python scripts/deploy_real.py --task reach \
-    --model outputs/reach_ppo_dr/final_model.zip \
-    --ip 192.168.1.185 \
-    --target 0.45 0.0 0.55 \
-    --dry-run
+# 컨트롤러 상태/에러 읽기만
+python -c "from xarm.wrapper import XArmAPI; a=XArmAPI('192.168.1.199'); print('state=', a.get_state()); print('err_warn=', a.get_err_warn_code()); print('q=', a.get_servo_angle(is_radian=True)); a.disconnect()"
 ```
-출력에서 매 step `q=[..] a=[..] ee=[..]` 가 합리적인 범위로 변하면 OK.
+- `err_warn=(0, [0, 0])` 면 컨트롤러 정상
+- `[0, 0]` 가 아니면 §7.6의 **에러 클리어** 먼저 수행
 
-### 7.4 9-point Grid Tour 실제 배포 ⭐
+### 7.4 미세 모션 진단 — SDK 호출 sanity (1분)
+SDK 호출 → 모션 체인이 실제로 동작하는지 joint1을 **0.57° (~0.01 rad)** 만 살짝 움직여 확인:
+```bash
+python scripts/diag_servo.py
+```
+- `return code : 0` + joint1이 살짝 움직이면 통신/모션 OK
+- code != 0 또는 안 움직이면 §7.6 참고
 
-시뮬에서 9/9 성공한 그 데모 시퀀스를 **실제 xArm6**에서 실행합니다. 한 명령으로 home → P0 → home → P1 → … → P8 → home 순서로 자동 순회합니다.
+### 7.5 9-point Grid Tour 실제 배포 ⭐ (안전 우선 모드)
+
+시뮬에서 9/9 성공한 데모 시퀀스를 **실제 xArm6**에서 실행합니다. 매 target마다:
+1. **position mode로 HOME_QPOS_RAD 정확 복귀** (학습 분포 보장)
+2. servo mode 전환 → 정책으로 P_i reach
+3. dwell → 다음 target
 
 ```bash
-# Dry-run (실제 모터 X, 스크립트/safe-zone 가드 sanity만 확인)
+# Dry-run (실제 모터 X, 스크립트 sanity만)
+python scripts/deploy_grid_tour.py \
+    --model outputs/reach_ppo_v2/final_model.zip --dry-run
+
+# 첫 실제 실행 — 매우 보수적 (E-stop 손에)
 python scripts/deploy_grid_tour.py \
     --model outputs/reach_ppo_v2/final_model.zip \
-    --ip 192.168.1.185 --dry-run
-
-# 실제 동작 — 30% 속도부터
-python scripts/deploy_grid_tour.py \
-    --model outputs/reach_ppo_v2/final_model.zip \
-    --ip 192.168.1.185 --speed 30 --hz 20 --dwell 1.0
+    --home-speed 0.15 \
+    --max-step-rad 0.005 \
+    --dwell 2.0
 ```
+> ⚠️ **`--max-step-rad`는 P로 가는 속도를 결정**합니다. joint 속도 = `max-step-rad × hz`. 0.005면 ~5.7°/s, TCP 6~10 cm/s. 한 사이클 6~10분. 충분히 안전한 걸 확인한 후 §7.5의 단계 표대로 점진적 증가.
 
-특징:
-- 9개 grid point 좌표가 [scripts/demo_grid_tour.py](scripts/demo_grid_tour.py)와 **완전히 일치** (시뮬-실제 1:1)
-- 매 target 사이마다 **home 자세 복귀** → 학습 분포 일치 → §6.4의 박스 설명 참고
-- 매 step **safe-zone hard guard**: TCP가 safe box 밖이면 즉시 segment 종료
-- `--dwell` 옵션: 각 target 도달 후 잠깐 대기 (시각 확인용)
+**속도 손잡이 (servo mode에서 `--speed`/`--hz`만으론 안 됨 — 아래 두 개가 실제로 적용됨)**
 
-> ⚠️ **dry-run 한계**: FakeArm에는 진짜 forward kinematics가 없어 TCP가 시뮬처럼 안 움직입니다. dry-run의 목적은 "스크립트가 끝까지 도는가" + "safe-zone 가드 코드 sanity" 검증입니다. 실제 success rate는 진짜 컨트롤러 연결 후에야 확인됩니다.
+| 인자 | 기본 | 의미 | 첫 실행 권장 |
+|---|---|---|---|
+| `--home-speed` | 0.15 rad/s | position mode로 HOME 이동 속도 | **0.10~0.15** (~5.7~8.6°/s) |
+| `--max-step-rad` | 0.015 rad | step당 joint 변화 hard cap → joint 속도 = 값 × hz | **0.005~0.015** |
+| `--collision-sensitivity` | 1 | xArm 충돌 감지 민감도 (0~5) | **1** (false trigger 회피) |
+| `--dwell` | 1.0 s | 각 target 도달 후 대기 | **2.0** (관찰 시간 확보) |
+| `--hz` | 20 | 정책 명령 송신 frequency | 20 |
+| `--speed` | 30 | servo mode에서 **무시됨** (호환용) | 신경 X |
 
-### 7.5 단일 target 실제 동작 — 더 보수적인 시작 (15분)
-```bash
-# 첫 시도: 30% 속도, 20Hz control
-python scripts/deploy_real.py --task reach \
-    --model outputs/reach_ppo_dr/final_model.zip \
-    --ip 192.168.1.185 \
-    --target 0.45 0.0 0.55 \
-    --speed 30 --hz 20
-```
+**한 사이클 시간**: 약 **2~3분** (9개 target, 각 home_reset + reach + dwell). 매번 position mode 복귀가 들어가 안전하지만 약간 느립니다.
 
-스크립트 내부 동작:
-1. `XArmAPI(ip)` 연결 → `motion_enable(True)` → `set_mode(1)` (servo mode) → `set_state(0)` → `move_gohome()`
-2. 매 1/hz 초:
-   - `arm.get_servo_angle(is_radian=True)` → joint q
-   - `arm.get_position(is_radian=True)` → TCP xyz (mm → m 변환)
-   - obs 구성 → `policy.predict(obs)` → action
-   - **Safe zone 가드**: TCP 박스 밖이면 즉시 중단
-   - `arm.set_servo_angle_j(target_q, is_radian=True, speed=…)`
-3. dist < 3 cm 도달 시 종료
+**특징**
+- 매 target 전 **컨트롤러가 직접** HOME_QPOS_RAD로 복귀 → drift 누적 없음
+- 매 step **safe-zone hard guard**: TCP가 박스 밖이면 즉시 segment 종료
+- **Ctrl+C 안전 정지**: 어디서 누르든 `set_state(4)` + `disconnect()` 보장
 
-### 7.5 점진적 검증 시나리오
-| Step | target | 의도 |
+**속도 단계적 증가 (각 단계 1 사이클 성공 후 다음)**
+
+| 단계 | `--home-speed` | `--max-step-rad` |
 |---|---|---|
-| 1 | 5 cm 짧은 이동 | 안전 검증 |
-| 2 | workspace 중앙 | 보통 케이스 |
-| 3 | workspace 모서리 | 가장자리 케이스 |
-| 4 | 10개 랜덤 target | success rate 측정 |
+| 1차 (관찰) | 0.10 | 0.005 |
+| **2차 (권장 첫 실행)** | **0.15** | **0.015** |
+| 3차 (검증 후) | 0.30 | 0.030 |
+| 4차 (시연 속도) | 0.50 | 0.050 |
 
 ### 7.6 문제 발생 대응
+
+**(a) 에러/충돌 발생 시 — 컨트롤러 에러 클리어**
+```bash
+python -c "from xarm.wrapper import XArmAPI; import time; a=XArmAPI('192.168.1.199'); print('before:', a.get_err_warn_code(), a.get_state()); a.clean_error(); a.clean_warn(); a.motion_enable(True); a.set_mode(0); a.set_state(0); time.sleep(0.3); print('after :', a.get_err_warn_code(), a.get_state()); a.disconnect()"
+```
+`after: (0, [0, 0]) (0, 0)` 나오면 복구 완료. 안 사라지면 xArm Studio GUI에서 Clear 필수.
+
+**(b) 팔이 벽/물체에 끼어있을 때**
+
+xArm Studio → **Manual Mode 켜기** → 손으로 안전한 자세로 빼내기 → Position Mode 전환 → Clear → Enable.
+모터 enable 상태에서 강제로 손으로 풀려 하면 모터 손상 가능.
+
+**(c) 증상별 표**
+
 | 증상 | 원인 후보 | 대응 |
 |---|---|---|
-| 떨림 / jitter | action_scale ↑, control rate 부족 | `--action-scale 0.03 --hz 30` |
-| 안 움직임 | servo mode 실패, 모터 disable | xArm Studio에서 enable 확인 |
-| 잘못된 방향 | 시뮬 ↔ 실제 좌표계 차이 | HOME_QPOS 캘리브레이션 (아래) |
-| Safe-zone 침범 즉시 중단 | 정상 (가드 작동) | target 조정 |
+| 시작 모션(HOME 이동)이 너무 빠름 | `--home-speed` 높음 | `--home-speed 0.10` |
+| 정책 reach가 느리거나 못 도달 | `--max-step-rad` 너무 작음 → 정책 방향 왜곡 | `--max-step-rad 0.015 → 0.03` 단계 증가 |
+| 매 target 같은 자세에서 출발 안 됨 | (현재 코드는 자동 hard reset함 — 발생 시 버그 보고) | (해당 없음) |
+| collision 즉시 발동 | sensitivity 높음 + 정책 첫 step current spike | `--collision-sensitivity 1` (기본) |
+| code=1 거부 spam | mode/state 깨짐 또는 joint limit boundary | §7.6 (a) 클리어 후 재실행 |
+| Safe-zone 침범 즉시 중단 | 정상 (가드 작동) | target/home 좌표 확인 |
+| 안 움직임 | motor disable / 에러 상태 | §7.6 (a) 클리어 |
 
 ### 7.7 좌표계 캘리브레이션 (필요시)
 1. xArm Studio에서 home에 둔 뒤 `arm.get_servo_angle()` 출력 → 예: `[0, -17.2, -68.8, 0, 86.0, 0]` deg
 2. [base_env.py:25](xarm_rl/envs/base_env.py) `HOME_QPOS`와 비교 (rad 단위)
-3. 차이 있으면 deploy 시 offset 추가
+3. 차이 있으면 deploy 스크립트의 `HOME_QPOS_RAD` 상수 수정 ([deploy_grid_tour.py:48](scripts/deploy_grid_tour.py#L48))
 
 ### 7.8 안전 / 운영 팁
 - 노트북 ↔ 컨트롤러 **직결** (인터넷 노출 X)
-- xArm Studio에서 `set_collision_sensitivity(3)` 이상 권장 (충돌 시 즉시 정지)
+- E-stop은 모든 실행 동안 손에 쥐기
+- `--collision-sensitivity` 기본 1. **검증 끝나기 전엔 3 이상 금지** (false trigger로 중단되어도 OK, 충돌로 망가지는 것보단 나음)
 - 매 step 로깅: `q`, TCP, action, info → 사후 분석용 (자체 추가 권장)
 - 컨트롤러 자체 로그도 xArm Studio → Logs에서 별도 보관
+- 첫 사이클 끝까지 성공한 뒤에만 속도 단계적 증가 (§7.5의 단계 표)
 
 ---
 

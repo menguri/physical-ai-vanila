@@ -3,14 +3,16 @@
 DANGER: This drives a real robot. Start with --dry-run, then --speed 30,
 keep the e-stop in hand. Tested for Reach task (no gripper) first.
 
+Controller default: IP 192.168.1.199, Modbus TCP port 502 (SDK uses 502 internally).
+
 Usage:
     # dry-run: print actions only
     python scripts/deploy_real.py --task reach --model outputs/reach/final_model.zip \\
-        --ip 192.168.1.185 --dry-run
+        --dry-run
 
-    # real run at 30% speed
+    # real run at 30% speed (uses default --ip 192.168.1.199)
     python scripts/deploy_real.py --task reach --model outputs/reach/final_model.zip \\
-        --ip 192.168.1.185 --speed 30
+        --speed 30
 """
 from __future__ import annotations
 
@@ -28,6 +30,10 @@ except ImportError:
 
 
 HOME_DEG = [0.0, -17.2, -68.8, 0.0, 86.0, 0.0]  # ≈ HOME_QPOS in degrees
+HOME_QPOS_RAD = np.deg2rad(HOME_DEG).astype(np.float32)
+_JL_MARGIN = 0.02
+JOINT_LIMITS_LOW  = np.array([-6.283, -2.059, -3.927, -6.283, -1.693, -6.283], dtype=np.float32) + _JL_MARGIN
+JOINT_LIMITS_HIGH = np.array([ 6.283,  2.094,  0.191,  6.283,  3.142,  6.283], dtype=np.float32) - _JL_MARGIN
 
 # Real xArm6 safe zone (meters, base frame).
 # Hard guard at deploy time — policy actions will be rejected if predicted TCP exits this box.
@@ -76,7 +82,9 @@ def main():
     ap.add_argument("--task", choices=["reach"], required=True,
                     help="pick_place not yet supported on real (gripper integration TODO)")
     ap.add_argument("--model", required=True)
-    ap.add_argument("--ip", required=True)
+    ap.add_argument("--ip", default="192.168.1.199", help="xArm controller IP (default: 192.168.1.199)")
+    ap.add_argument("--port", type=int, default=502,
+                    help="Modbus TCP port — informational only; XArmAPI uses 502 internally")
     ap.add_argument("--target", nargs=3, type=float, default=[0.45, 0.0, 0.55],
                     help="target xyz in meters (world frame)")
     ap.add_argument("--speed", type=int, default=30, help="0-100, xArm servo speed")
