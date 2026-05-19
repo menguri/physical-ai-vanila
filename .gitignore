@@ -22,8 +22,11 @@ outputs/gif/*
 !outputs/gif/ppo_v2_grid_tour_small.gif
 !outputs/gif/ppo_v2_rollout.gif
 !outputs/gif/ppo_dr_grid_tour_small.gif
+!outputs/gif/ppo_dr_rollout.gif
+!outputs/gif/sac_v3_grid_tour_small.gif
 !outputs/gif/sac_v3_rollout_best.gif
 !outputs/gif/sac_dr_grid_tour_small.gif
+!outputs/gif/sac_dr_rollout.gif
 
 !outputs/reach_ppo_v2/
 outputs/reach_ppo_v2/*

@@ -85,7 +85,7 @@
 |---|---|:---:|---|:---:|:---:|:---:|
 | 1 | **PPO** (baseline) | ❌ | 짧음 | **86%** | 3.22 cm | 9/9 ✅ |
 | 2 | **PPO + DR** ⭐ | ✅ | 김 | **86%** | 3.36 cm | 9/9 ✅ |
-| 3 | **SAC** (baseline) | ❌ | 짧음 | **86%** | 3.52 cm | (rollout만) |
+| 3 | **SAC** (baseline) | ❌ | 짧음 | **86%** | 3.52 cm | 9/9 ✅ |
 | 4 | **SAC + DR** | ✅ | 김 | **84%** | 3.77 cm | 9/9 ✅ |
 
 ⭐ **실제 배포 권장: PPO + DR** — 시뮬 성능은 다른 조합과 비슷하지만 DR로 학습되어 실제 로봇의 마찰/지연 차이에 더 robust.
@@ -97,9 +97,9 @@
 | | Grid Tour (9개 점 순회) | 일반 rollout (랜덤 target) |
 |---|:---:|:---:|
 | **PPO** | ![](outputs/gif/ppo_v2_grid_tour_small.gif) | ![](outputs/gif/ppo_v2_rollout.gif) |
-| **PPO + DR** | ![](outputs/gif/ppo_dr_grid_tour_small.gif) | — |
-| **SAC** | — | ![](outputs/gif/sac_v3_rollout_best.gif) |
-| **SAC + DR** | ![](outputs/gif/sac_dr_grid_tour_small.gif) | — |
+| **PPO + DR** | ![](outputs/gif/ppo_dr_grid_tour_small.gif) | ![](outputs/gif/ppo_dr_rollout.gif) |
+| **SAC** | ![](outputs/gif/sac_v3_grid_tour_small.gif) | ![](outputs/gif/sac_v3_rollout_best.gif) |
+| **SAC + DR** | ![](outputs/gif/sac_dr_grid_tour_small.gif) | ![](outputs/gif/sac_dr_rollout.gif) |
 
 ---
 
