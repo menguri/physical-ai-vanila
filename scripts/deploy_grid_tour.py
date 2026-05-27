@@ -25,6 +25,7 @@ SAFETY
 from __future__ import annotations
 
 import argparse
+import csv
 import time
 from pathlib import Path
 
@@ -43,6 +44,10 @@ GRID_X = [0.32, 0.42, 0.52]
 GRID_Y = [-0.20, 0.00, 0.20]
 GRID_Z = 0.45
 HOME_TARGET = np.array([0.42, 0.00, 0.55], dtype=np.float32)
+
+# Reach task workspace bounds (match xarm_rl/envs/reach_env.py)
+WORKSPACE_LOW  = np.array([0.25, -0.30, 0.30], dtype=np.float32)
+WORKSPACE_HIGH = np.array([0.55,  0.30, 0.55], dtype=np.float32)
 
 # Home joint pose (radians) — must match xarm_rl/envs/base_env.py:HOME_QPOS
 HOME_QPOS_RAD = np.array([0.0, -0.3, -1.2, 0.0, 1.5, 0.0], dtype=np.float32)
@@ -63,14 +68,19 @@ ALGO_CLS = {"ppo": PPO, "sac": SAC}
 
 
 # -----------------------------------------------------------------------------
-def build_targets():
-    """Snake-order 3x3 grid identical to demo_grid_tour.py."""
-    pts = []
-    for i, y in enumerate(GRID_Y):
-        xs = GRID_X if i % 2 == 0 else list(reversed(GRID_X))
-        for x in xs:
-            pts.append(np.array([x, y, GRID_Z], dtype=np.float32))
-    return pts
+def build_targets(goal_mode: str, num_goals: int, seed: int | None):
+    """Build targets for grid or random modes."""
+    if goal_mode == "grid":
+        pts = []
+        for i, y in enumerate(GRID_Y):
+            xs = GRID_X if i % 2 == 0 else list(reversed(GRID_X))
+            for x in xs:
+                pts.append(np.array([x, y, GRID_Z], dtype=np.float32))
+        return pts
+
+    rng = np.random.default_rng(seed)
+    pts = rng.uniform(WORKSPACE_LOW, WORKSPACE_HIGH, size=(num_goals, 3)).astype(np.float32)
+    return [pts[i] for i in range(num_goals)]
 
 
 def in_safe_zone(ee_pos_m: np.ndarray) -> bool:
@@ -116,7 +126,105 @@ class FakeArm:
 
 
 # -----------------------------------------------------------------------------
-def goto_joint_home(arm, args):
+class TrajectoryLogger:
+    def __init__(self, log_dir: Path, log_hz: float):
+        self.log_dir = Path(log_dir)
+        self.log_dir.mkdir(parents=True, exist_ok=True)
+        self.log_hz = log_hz
+
+        self.goal_path = self.log_dir / "trajectory_to_goals.csv"
+        self.home_path = self.log_dir / "trajectory_to_initial.csv"
+
+        self.fieldnames = (
+            ["segment_type", "target_idx", "segment_step", "timestamp"]
+            + [f"input_q{i+1}" for i in range(6)]
+            + [f"input_qd{i+1}" for i in range(6)]
+            + ["input_ee_x", "input_ee_y", "input_ee_z"]
+            + ["input_target_x", "input_target_y", "input_target_z"]
+            + ["input_diff_x", "input_diff_y", "input_diff_z"]
+            + [f"input_obs{i}" for i in range(21)]
+            + [f"output_action_raw{i+1}" for i in range(6)]
+            + [f"output_action_clip{i+1}" for i in range(6)]
+            + [f"output_step_delta{i+1}" for i in range(6)]
+            + [f"output_target_q{i+1}" for i in range(6)]
+            + ["dist", "in_safe_zone", "success_flag"]
+        )
+
+        self._goal_file, self._goal_writer = self._open_writer(self.goal_path)
+        self._home_file, self._home_writer = self._open_writer(self.home_path)
+
+    def _open_writer(self, path: Path):
+        is_new = not path.exists() or path.stat().st_size == 0
+        f = path.open("a", newline="")
+        writer = csv.DictWriter(f, fieldnames=self.fieldnames)
+        if is_new:
+            writer.writeheader()
+            f.flush()
+        return f, writer
+
+    def close(self):
+        self._goal_file.close()
+        self._home_file.close()
+
+    def _fill_action(self, arr):
+        if arr is None:
+            return [float("nan")] * 6
+        return [float(x) for x in arr]
+
+    def log_step(
+        self,
+        segment_type: str,
+        target_idx: int,
+        segment_step: int,
+        timestamp: float,
+        q: np.ndarray,
+        qd: np.ndarray,
+        ee: np.ndarray,
+        target: np.ndarray,
+        diff: np.ndarray,
+        obs: np.ndarray,
+        action_raw: np.ndarray | None,
+        action_clip: np.ndarray | None,
+        step_delta: np.ndarray | None,
+        target_q: np.ndarray | None,
+        dist: float,
+        in_safe: bool,
+        success_flag: bool,
+    ):
+        row = {
+            "segment_type": segment_type,
+            "target_idx": int(target_idx),
+            "segment_step": int(segment_step),
+            "timestamp": float(timestamp),
+            **{f"input_q{i+1}": float(q[i]) for i in range(6)},
+            **{f"input_qd{i+1}": float(qd[i]) for i in range(6)},
+            "input_ee_x": float(ee[0]),
+            "input_ee_y": float(ee[1]),
+            "input_ee_z": float(ee[2]),
+            "input_target_x": float(target[0]),
+            "input_target_y": float(target[1]),
+            "input_target_z": float(target[2]),
+            "input_diff_x": float(diff[0]),
+            "input_diff_y": float(diff[1]),
+            "input_diff_z": float(diff[2]),
+            **{f"input_obs{i}": float(obs[i]) for i in range(21)},
+            **{f"output_action_raw{i+1}": v for i, v in enumerate(self._fill_action(action_raw))},
+            **{f"output_action_clip{i+1}": v for i, v in enumerate(self._fill_action(action_clip))},
+            **{f"output_step_delta{i+1}": v for i, v in enumerate(self._fill_action(step_delta))},
+            **{f"output_target_q{i+1}": v for i, v in enumerate(self._fill_action(target_q))},
+            "dist": float(dist),
+            "in_safe_zone": float(in_safe),
+            "success_flag": float(success_flag),
+        }
+
+        writer = self._goal_writer if segment_type == "to_goal" else self._home_writer
+        writer.writerow(row)
+        (self._goal_file if segment_type == "to_goal" else self._home_file).flush()
+
+
+# -----------------------------------------------------------------------------
+def goto_joint_home(arm, args, logger: TrajectoryLogger | None = None,
+                    target_idx: int | None = None, log_segment: bool = False):
     """Drive arm to HOME_QPOS_RAD via position mode, then return to servo mode.
 
     Called once at startup AND between every target segment so each P_i begins
@@ -128,13 +236,82 @@ def goto_joint_home(arm, args):
     if args.dry_run:
         arm._q = HOME_QPOS_RAD.copy()
         arm._tcp_mm = np.array([420.0, 0.0, 550.0], dtype=np.float32)
+        if logger is not None and log_segment and target_idx is not None:
+            q, ee = read_state(arm, args.dry_run)
+            qd = np.zeros(6, dtype=np.float32)
+            diff = HOME_TARGET - ee
+            obs = build_obs(q, qd, ee, HOME_TARGET)
+            logger.log_step(
+                segment_type="to_initial",
+                target_idx=target_idx,
+                segment_step=0,
+                timestamp=time.time(),
+                q=q,
+                qd=qd,
+                ee=ee,
+                target=HOME_TARGET,
+                diff=diff,
+                obs=obs,
+                action_raw=None,
+                action_clip=None,
+                step_delta=HOME_QPOS_RAD - q,
+                target_q=HOME_QPOS_RAD,
+                dist=float(np.linalg.norm(diff)),
+                in_safe=in_safe_zone(ee),
+                success_flag=True,
+            )
         return
 
     arm.set_mode(0)
     arm.set_state(state=0)
     time.sleep(0.2)
-    arm.set_servo_angle(angle=HOME_QPOS_RAD.tolist(), is_radian=True,
-                        speed=args.home_speed, wait=True)
+    if logger is None or not log_segment:
+        arm.set_servo_angle(angle=HOME_QPOS_RAD.tolist(), is_radian=True,
+                            speed=args.home_speed, wait=True)
+    else:
+        arm.set_servo_angle(angle=HOME_QPOS_RAD.tolist(), is_radian=True,
+                            speed=args.home_speed, wait=False)
+        log_dt = 1.0 / args.log_hz
+        prev_q = None
+        start_t = time.time()
+        step = 0
+        while True:
+            q, ee = read_state(arm, args.dry_run)
+            qd = np.zeros(6, dtype=np.float32) if prev_q is None else (q - prev_q) / log_dt
+            prev_q = q
+            diff = HOME_TARGET - ee
+            dist = float(np.linalg.norm(diff))
+            obs = build_obs(q, qd, ee, HOME_TARGET)
+            logger.log_step(
+                segment_type="to_initial",
+                target_idx=target_idx,
+                segment_step=step,
+                timestamp=time.time(),
+                q=q,
+                qd=qd,
+                ee=ee,
+                target=HOME_TARGET,
+                diff=diff,
+                obs=obs,
+                action_raw=None,
+                action_clip=None,
+                step_delta=HOME_QPOS_RAD - q,
+                target_q=HOME_QPOS_RAD,
+                dist=dist,
+                in_safe=in_safe_zone(ee),
+                success_flag=dist < SUCCESS_DIST,
+            )
+
+            if np.max(np.abs(q - HOME_QPOS_RAD)) < 0.01:
+                break
+            if (time.time() - start_t) > args.home_timeout:
+                print("  [home_reset] timeout while returning home")
+                break
+
+            step += 1
+            elapsed = time.time() - start_t
+            if elapsed < log_dt * (step + 1):
+                time.sleep(log_dt * (step + 1) - elapsed)
     time.sleep(0.2)
     arm.set_mode(1)
     arm.set_state(state=0)
@@ -163,7 +340,9 @@ def read_state(arm, dry_run: bool):
     return q, ee
 
 
-def run_segment(arm, policy, target_xyz: np.ndarray, args, label: str) -> tuple[bool, float]:
+def run_segment(arm, policy, target_xyz: np.ndarray, args, label: str,
+                logger: TrajectoryLogger | None = None,
+                target_idx: int | None = None) -> tuple[bool, float]:
     """Drive the arm with the policy toward target_xyz until success or max_steps."""
     dt = 1.0 / args.hz
     prev_q = None
@@ -178,12 +357,34 @@ def run_segment(arm, policy, target_xyz: np.ndarray, args, label: str) -> tuple[
 
         # Safe-zone hard guard
         if not in_safe_zone(ee):
+            if logger is not None and target_idx is not None:
+                diff = target_xyz - ee
+                obs = build_obs(q, qd, ee, target_xyz)
+                logger.log_step(
+                    segment_type="to_goal",
+                    target_idx=target_idx,
+                    segment_step=step,
+                    timestamp=time.time(),
+                    q=q,
+                    qd=qd,
+                    ee=ee,
+                    target=target_xyz,
+                    diff=diff,
+                    obs=obs,
+                    action_raw=None,
+                    action_clip=None,
+                    step_delta=None,
+                    target_q=None,
+                    dist=float(np.linalg.norm(diff)),
+                    in_safe=False,
+                    success_flag=False,
+                )
             print(f"  [{label}] [SAFETY] TCP {ee} outside safe zone — STOPPING segment")
             return False, float(np.linalg.norm(target_xyz - ee))
 
         obs = build_obs(q, qd, ee, target_xyz)
-        action, _ = policy.predict(obs, deterministic=True)
-        action = np.clip(action, -1.0, 1.0).astype(np.float32)[:6]
+        action_raw, _ = policy.predict(obs, deterministic=True)
+        action = np.clip(action_raw, -1.0, 1.0).astype(np.float32)[:6]
 
         # Per-step joint delta hard cap (SAFETY): in servo mode the SDK's
         # `speed` arg is ignored — actual joint velocity = step_delta × hz.
@@ -208,6 +409,27 @@ def run_segment(arm, policy, target_xyz: np.ndarray, args, label: str) -> tuple[
             )
 
         last_dist = float(np.linalg.norm(target_xyz - ee))
+        if logger is not None and target_idx is not None:
+            diff = target_xyz - ee
+            logger.log_step(
+                segment_type="to_goal",
+                target_idx=target_idx,
+                segment_step=step,
+                timestamp=time.time(),
+                q=q,
+                qd=qd,
+                ee=ee,
+                target=target_xyz,
+                diff=diff,
+                obs=obs,
+                action_raw=action_raw[:6],
+                action_clip=action,
+                step_delta=step_delta,
+                target_q=target_q,
+                dist=last_dist,
+                in_safe=in_safe_zone(ee),
+                success_flag=last_dist < SUCCESS_DIST,
+            )
         if last_dist < SUCCESS_DIST:
             ok = True
             break
@@ -249,10 +471,24 @@ def main():
     ap.add_argument("--dry-run", action="store_true")
     ap.add_argument("--dwell", type=float, default=1.0,
                     help="pause (sec) at each target before returning home")
+    ap.add_argument("--log", action="store_true",
+                    help="enable trajectory logging to CSV")
+    ap.add_argument("--log-dir", type=str, default=None,
+                    help="output directory for CSV logs (default: outputs/real_runs/<timestamp>)")
+    ap.add_argument("--log-hz", type=float, default=None,
+                    help="logging frequency (default: --hz)")
+    ap.add_argument("--home-timeout", type=float, default=20.0,
+                    help="seconds to wait for home when logging")
+    ap.add_argument("--goal-mode", choices=["grid", "random"], default="grid",
+                    help="target mode: grid (default) or random (training workspace)")
+    ap.add_argument("--num-goals", type=int, default=100,
+                    help="number of random targets when --goal-mode random")
+    ap.add_argument("--seed", type=int, default=None,
+                    help="random seed for target sampling (optional)")
     args = ap.parse_args()
 
-    targets = build_targets()
-    print(f"[deploy] {len(targets)} grid targets in safe zone:")
+    targets = build_targets(args.goal_mode, args.num_goals, args.seed)
+    print(f"[deploy] {len(targets)} targets in safe zone (mode={args.goal_mode}):")
     for i, p in enumerate(targets):
         print(f"  P{i}: x={p[0]:.2f}  y={p[1]:+.2f}  z={p[2]:.2f}")
 
@@ -268,6 +504,13 @@ def main():
         print(f"[deploy] target HOME joint pose = {HOME_QPOS_RAD}  "
               f"(home_speed={args.home_speed} rad/s)")
 
+    logger = None
+    if args.log:
+        log_root = Path(args.log_dir) if args.log_dir else Path("outputs") / "real_runs" / time.strftime("%Y%m%d_%H%M%S")
+        log_hz = args.log_hz if args.log_hz is not None else args.hz
+        logger = TrajectoryLogger(log_root, log_hz)
+        print(f"[deploy] logging enabled: {log_root}")
+
     # Initial home — guaranteed training joint config
     goto_joint_home(arm, args)
     if not args.dry_run:
@@ -282,9 +525,10 @@ def main():
             print(f"\n>>> Target P{i} = {p}")
             # 1) HARD reset to training joint home (position mode — not policy)
             print(f"  [home_reset_P{i}] returning to HOME_QPOS_RAD via position mode")
-            goto_joint_home(arm, args)
+            goto_joint_home(arm, args, logger=logger, target_idx=i, log_segment=True)
             # 2) Reach target with policy
-            ok, _ = run_segment(arm, policy, p, args, label=f"P{i}")
+            ok, _ = run_segment(arm, policy, p, args, label=f"P{i}",
+                                logger=logger, target_idx=i)
             if ok:
                 successes += 1
             # 3) Optional dwell so an observer can see it landed
@@ -292,7 +536,7 @@ def main():
                 time.sleep(args.dwell)
 
         print(f"\n>>> Returning HOME (final)")
-        goto_joint_home(arm, args)
+        goto_joint_home(arm, args, logger=logger, target_idx=len(targets) - 1, log_segment=True)
 
         print(f"\n[deploy] {successes}/{len(targets)} targets reached")
     except KeyboardInterrupt:
@@ -301,6 +545,8 @@ def main():
         print(f"\n[deploy] aborted on exception: {e!r}")
         raise
     finally:
+        if logger is not None:
+            logger.close()
         if not args.dry_run:
             try:
                 arm.set_state(state=4)   # STOP — motors disabled, brakes engage
