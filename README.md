@@ -172,6 +172,81 @@ python -c "import mujoco, gymnasium, stable_baselines3, xarm_rl; \
 ```
 → `env OK, obs (21,)` 가 나오면 성공.
 
+### SpaceMouse + RealSense + LeRobot 데이터 수집 환경
+
+VLA fine-tuning용 LeRobot 포맷 데이터 수집은 새 스크립트
+`space_mouse/space_telecontrol.py`에서 처리한다. 기존 RL 학습/배포 코드는 건드리지 않는다.
+
+Windows에서 `uv`와 현재 `.venv`를 쓰는 경우:
+
+```powershell
+cd C:\Users\M207\Desktop\kang\code_factory\physical-ai-vanila
+
+# 이미 venv가 있다면 activate만 하면 된다.
+.\physical-ai-vanila\.venv\Scripts\activate
+
+# xArm SDK 포함. 기존 프로젝트 real extra.
+uv pip install -e '.\physical-ai-vanila[real]'
+
+# SpaceMouse, RealSense, OpenCV, LeRobot writer.
+uv pip install pyspacemouse pyrealsense2 opencv-python lerobot
+```
+
+필요 장치/패키지:
+
+- `xArm-Python-SDK`: xArm6 연결 및 Cartesian velocity 제어
+- `pyspacemouse`: SpaceMouse 입력
+- `pyrealsense2`: Intel RealSense D435 wrist camera
+- `opencv-python`: RealSense BGR frame을 LeRobot용 RGB로 변환
+- `lerobot`: `LeRobotDataset.create()` / `add_frame()` / `save_episode()` / `finalize()`
+
+`lerobot` repo 위치:
+
+- inner 프로젝트 폴더(`physical-ai-vanila/physical-ai-vanila`) 안에 `lerobot` repo를 넣을 필요는 없다.
+- 현재 권장 구조는 sibling layout이다.
+
+```text
+C:\Users\M207\Desktop\kang\code_factory\physical-ai-vanila\
+  lerobot\                 # optional local LeRobot checkout
+    src\lerobot\...
+  physical-ai-vanila\
+    space_mouse\
+      space_telecontrol.py
+```
+
+`space_telecontrol.py`는 실행 시 `..\lerobot\src`가 있으면 그것을 먼저 import한다. 이 로컬 checkout이 없으면 `.venv`에 설치된 `lerobot` 패키지를 사용한다. LeRobot v3 writer API를 맞춰 쓰는 목적이면 현재처럼 sibling `lerobot` checkout을 유지하는 쪽이 가장 안전하다.
+
+실행:
+
+```powershell
+cd C:\Users\M207\Desktop\kang\code_factory\physical-ai-vanila\physical-ai-vanila
+
+# 조종만: 카메라/LeRobot writer는 켜지지 않는다.
+python space_mouse/space_telecontrol.py `
+  --ip 192.168.1.199 `
+  --fps 10
+
+# 조종 + LeRobot 포맷 기록: RealSense wrist RGB도 함께 연결된다.
+python space_mouse/space_telecontrol.py `
+  --ip 192.168.1.199 `
+  --fps 10 `
+  --record `
+  --repo-id kangkang9412/xarm6_spacemouse_demo `
+  --root ./data/xarm6_spacemouse_demo `
+  --task "pick up the object"
+```
+
+`--fps 10`은 로봇 조종 속도가 아니라 데이터 저장 주기다. 기본 제어 루프는 `--control-hz 30`이라 SpaceMouse 입력과 xArm Cartesian velocity command는 초당 30회 처리되고, LeRobot frame 저장만 초당 10회 수행된다. 더 촘촘한 데이터가 필요하면 `--fps 15` 또는 `--fps 20`으로 올릴 수 있지만, 용량과 비디오 인코딩 비용도 같이 늘어난다.
+
+`--record`가 켜졌을 때 저장되는 LeRobot feature:
+
+```text
+observation.images.wrist   RGB video, uint8, 480x640x3
+observation.state          float32[7], current TCP 6D pose + gripper
+action                     float32[7], target TCP 6D pose + gripper
+task                       add_frame()에 같이 전달되는 task string
+```
+
 ---
 
 ## 6. 학습 프로세스

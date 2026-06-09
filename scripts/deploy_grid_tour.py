@@ -487,6 +487,9 @@ def main():
                     help="random seed for target sampling (optional)")
     args = ap.parse_args()
 
+    if args.log_hz is None:
+        args.log_hz = args.hz
+
     targets = build_targets(args.goal_mode, args.num_goals, args.seed)
     print(f"[deploy] {len(targets)} targets in safe zone (mode={args.goal_mode}):")
     for i, p in enumerate(targets):
