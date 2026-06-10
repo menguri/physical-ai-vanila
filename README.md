@@ -189,7 +189,7 @@ python scripts/deploy_grid_tour.py `
 
 실제 배포 GIF:
 
-![real xArm6 grid tour](outputs/gif/real_grid_tour.gif)
+![real xArm6 grid tour](outputs/gif/xarm-real-ppo.gif)
 
 ## SpaceMouse로 LeRobot 데이터 수집
 
