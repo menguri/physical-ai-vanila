@@ -144,6 +144,7 @@ remote: 10server:/home/mlic/mingukang/lerobot/collected_demo/data
 
 로봇 PC의 [sh_scripts/env.sh](sh_scripts/env.sh)에서 inference할 checkpoint를 등록합니다.
 
+### 6.6 시뮬 데모 GIF 만들기
 ```bash
 POLICY_TYPE=pi05
 POLICY_PATH=/home/mlic/mingukang/lerobot/outputs/train/pi05_real_full_wandb_20260612_160420/checkpoints/025000/pretrained_model
@@ -187,6 +188,7 @@ robot PC 127.0.0.1:8080 -> 10server 127.0.0.1:8080
 
 포트가 꼬였을 때:
 
+### 7.4 실제 동작 — 9-point Grid Tour ⭐
 ```bash
 fuser -v 8080/tcp 18080/tcp
 fuser -k 8080/tcp 18080/tcp
