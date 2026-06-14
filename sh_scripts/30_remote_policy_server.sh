@@ -10,7 +10,7 @@ source "${SCRIPT_DIR}/env.sh"
 
 ssh -t "${REMOTE}" \
   "cd '${REMOTE_LEROBOT_ROOT}' && ${REMOTE_SETUP} python -m lerobot.async_inference.policy_server \
-    --host='${REMOTE_POLICY_HOST}' \
+    --host='127.0.0.1' \
     --port='${REMOTE_POLICY_PORT}' \
     --fps='${FPS}' \
     --obs_queue_timeout=1"
