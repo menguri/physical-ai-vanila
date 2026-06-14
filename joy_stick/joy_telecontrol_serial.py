@@ -28,8 +28,10 @@ import select
 import shutil
 import struct
 import sys
+import termios
 import threading
 import time
+import tty
 from pathlib import Path
 
 import numpy as np
@@ -72,6 +74,9 @@ JS_EVENT_SIZE = struct.calcsize(JS_EVENT_FORMAT)
 JS_EVENT_BUTTON = 0x01
 JS_EVENT_AXIS = 0x02
 JS_EVENT_INIT = 0x80
+
+# PPO home joint pose used by xarm_rl/envs/base_env.py and real deploy scripts.
+PPO_HOME_QPOS_RAD = np.array([0.0, -0.3, -1.2, 0.0, 1.5, 0.0], dtype=np.float32)
 
 
 def import_required(module_name: str, install_hint: str):
@@ -632,6 +637,7 @@ class XArm6ServoCartesian:
             raise SystemExit("xArm-Python-SDK is not installed. pip install xArm-Python-SDK") from exc
 
         self.arm = XArmAPI(ip, is_radian=True)
+        self.gripper_speed = int(gripper_speed)
         time.sleep(0.5)
 
         if getattr(self.arm, "warn_code", 0) != 0:
@@ -652,11 +658,14 @@ class XArm6ServoCartesian:
 
     def setup_gripper(self, gripper_speed: int) -> None:
         if hasattr(self.arm, "set_gripper_enable"):
-            self.arm.set_gripper_enable(True)
+            ret = self.arm.set_gripper_enable(True)
+            print(f"[joy-teleop] set_gripper_enable ret={ret}")
         if hasattr(self.arm, "set_gripper_mode"):
-            self.arm.set_gripper_mode(0)
+            ret = self.arm.set_gripper_mode(0)
+            print(f"[joy-teleop] set_gripper_mode ret={ret}")
         if hasattr(self.arm, "set_gripper_speed"):
-            self.arm.set_gripper_speed(gripper_speed)
+            ret = self.arm.set_gripper_speed(gripper_speed)
+            print(f"[joy-teleop] set_gripper_speed ret={ret}, speed={gripper_speed}")
 
     def read_state(self) -> np.ndarray:
         code, pose = self.arm.get_position(is_radian=True)
@@ -682,9 +691,57 @@ class XArm6ServoCartesian:
             )
         )
 
-    def command_gripper(self, target: float) -> None:
-        if hasattr(self.arm, "set_gripper_position"):
-            self.arm.set_gripper_position(float(target), wait=False)
+    def return_to_joint_home(
+        self,
+        home_qpos_rad: np.ndarray,
+        gripper_target: float | None,
+        speed: float,
+        acc: float,
+    ) -> np.ndarray:
+        home_qpos_rad = np.asarray(home_qpos_rad, dtype=np.float32)
+        if home_qpos_rad.shape != (6,):
+            raise ValueError(f"home_qpos_rad must have shape (6,), got {home_qpos_rad.shape}")
+
+        self.arm.set_mode(0)
+        self.arm.set_state(0)
+        time.sleep(0.2)
+        ret = int(
+            self.arm.set_servo_angle(
+                angle=[float(v) for v in home_qpos_rad],
+                speed=float(speed),
+                mvacc=float(acc),
+                is_radian=True,
+                wait=True,
+            )
+        )
+        if ret != 0:
+            raise RuntimeError(f"return to PPO joint home failed: ret={ret}, qpos={home_qpos_rad.tolist()}")
+
+        if gripper_target is not None:
+            self.command_gripper(float(gripper_target))
+
+        self.arm.set_mode(1)
+        self.arm.set_state(0)
+        time.sleep(0.2)
+        return self.read_state()
+
+    def command_gripper(self, target: float) -> int | None:
+        if not hasattr(self.arm, "set_gripper_position"):
+            print("[joy-teleop] WARNING: xArm API has no set_gripper_position")
+            return None
+
+        target = float(target)
+        try:
+            return int(
+                self.arm.set_gripper_position(
+                    target,
+                    wait=False,
+                    speed=self.gripper_speed,
+                    auto_enable=True,
+                )
+            )
+        except TypeError:
+            return int(self.arm.set_gripper_position(target, wait=False))
 
     def emergency_stop(self) -> None:
         try:
@@ -747,14 +804,13 @@ def button_edge(pad: Gamepad, button: int, previous: bool) -> tuple[bool, bool]:
     return current and not previous, current
 
 
-def enter_pressed() -> bool:
+def read_keyboard_key() -> str | None:
     if not sys.stdin.isatty():
-        return False
+        return None
     readable, _, _ = select.select([sys.stdin], [], [], 0)
     if not readable:
-        return False
-    sys.stdin.readline()
-    return True
+        return None
+    return sys.stdin.read(1)
 
 
 def dataset_has_pending_frames(dataset) -> bool:
@@ -775,6 +831,21 @@ def return_to_initial_pose(
     initial_pose7: np.ndarray,
     args,
 ) -> np.ndarray:
+    return_home_mode = getattr(args, "return_home_mode", "cartesian-start")
+    if return_home_mode == "joint-home":
+        home_qpos_rad = np.asarray(getattr(args, "home_qpos_rad", PPO_HOME_QPOS_RAD), dtype=np.float32)
+        home_gripper = getattr(args, "home_gripper", None)
+        gripper_target = float(initial_pose7[6]) if home_gripper is None else float(home_gripper)
+        print("[joy-teleop] returning to PPO joint home...")
+        state7 = robot.return_to_joint_home(
+            home_qpos_rad,
+            gripper_target=gripper_target,
+            speed=float(getattr(args, "return_home_joint_speed", 0.35)),
+            acc=float(getattr(args, "return_home_joint_acc", 2.0)),
+        )
+        print(f"[joy-teleop] returned to PPO joint home: {np.round(state7, 3).tolist()}")
+        return state7
+
     print("[joy-teleop] returning to initial state...")
     start = current_pose7.copy()
     goal = clamp_target_pose(initial_pose7, args)
@@ -809,17 +880,30 @@ def record_action_from_target(state7: np.ndarray, target_pose7: np.ndarray, acti
 def teleop_loop(args, robot: XArm6ServoCartesian, cameras: dict[str, RealSenseCamera] | None, dataset) -> None:
     pad = Gamepad(args.device)
     pad.settle()
+    old_terminal_attrs = None
+    if sys.stdin.isatty():
+        old_terminal_attrs = termios.tcgetattr(sys.stdin)
+        tty.setcbreak(sys.stdin.fileno())
 
     control_dt = 1.0 / args.control_hz
     record_dt = 1.0 / args.fps
     next_record_t = time.time()
 
-    initial_pose7 = robot.read_state()
-    target_pose7 = initial_pose7.copy()
+    start_pose7 = robot.read_state()
+    initial_pose7 = (
+        np.asarray(args.initial_pose7, dtype=np.float32)
+        if args.initial_pose7 is not None
+        else start_pose7.copy()
+    )
+    target_pose7 = start_pose7.copy()
     gripper_target = float(target_pose7[6])
-    previous_gripper_button = False
     discard_episode = False
     return_home_on_exit = False
+    previous_close_held = False
+    previous_open_held = False
+    last_gripper_command_t = 0.0
+    last_gripper_log_t = 0.0
+    last_gripper_ret: int | None = None
 
     print("[joy-teleop] running")
     print(f"  device : {pad.name} ({args.device})")
@@ -827,9 +911,14 @@ def teleop_loop(args, robot: XArm6ServoCartesian, cameras: dict[str, RealSenseCa
     print("  LB / LT     : TCP Z up / down")
     print("  right stick : TCP roll / pitch")
     print("  RB / RT     : TCP yaw + / -")
-    print("  A           : toggle gripper")
+    print("  close btn   : hold to close gripper")
+    print("  open btn    : hold to open gripper")
     print("  SELECT      : save and exit")
-    print("  Enter       : save, return to initial state, and exit")
+    print(f"  return mode : {args.return_home_mode}")
+    if args.return_home_mode == "joint-home":
+        print(f"  home qpos   : {np.round(args.home_qpos_rad, 4).tolist()}")
+    print("  Enter       : save, return home, and exit")
+    print("  Esc         : discard episode, return home, and exit")
     print("  START       : emergency stop and discard episode")
     print("  Ctrl+C      : save and exit")
 
@@ -842,8 +931,14 @@ def teleop_loop(args, robot: XArm6ServoCartesian, cameras: dict[str, RealSenseCa
                 print("[joy-teleop] save button pressed.")
                 break
 
-            if enter_pressed():
-                print("[joy-teleop] Enter pressed; save, return to initial state, and exit.")
+            key = read_keyboard_key()
+            if key in ("\n", "\r"):
+                print("[joy-teleop] Enter pressed; save, return home, and exit.")
+                return_home_on_exit = True
+                break
+            if key == "\x1b":
+                print("[joy-teleop] Esc pressed; discard episode, return home, and exit.")
+                discard_episode = True
                 return_home_on_exit = True
                 break
 
@@ -856,16 +951,49 @@ def teleop_loop(args, robot: XArm6ServoCartesian, cameras: dict[str, RealSenseCa
             delta7, _ = joystick_to_pose_delta(pad, args, control_dt)
             target_pose7[:6] += delta7[:6]
 
-            gripper_pressed, previous_gripper_button = button_edge(
-                pad,
-                args.gripper_toggle_button,
-                previous_gripper_button,
-            )
-            if gripper_pressed:
-                midpoint = 0.5 * (args.gripper_min + args.gripper_max)
-                gripper_target = args.gripper_min if gripper_target > midpoint else args.gripper_max
-                robot.command_gripper(gripper_target)
-                print(f"[joy-teleop] gripper target: {gripper_target:.1f}")
+            close_held = pad.button(args.gripper_close_button)
+            open_held = pad.button(args.gripper_open_button)
+            if close_held != previous_close_held:
+                state = "pressed" if close_held else "released"
+                print(f"[joy-teleop] gripper close button {state} (button={args.gripper_close_button})")
+                previous_close_held = close_held
+            if open_held != previous_open_held:
+                state = "pressed" if open_held else "released"
+                print(f"[joy-teleop] gripper open button {state} (button={args.gripper_open_button})")
+                previous_open_held = open_held
+
+            gripper_delta = 0.0
+            if close_held and not open_held:
+                gripper_delta = -args.gripper_rate * control_dt
+            elif open_held and not close_held:
+                gripper_delta = args.gripper_rate * control_dt
+
+            if gripper_delta != 0.0:
+                gripper_target += gripper_delta
+                gripper_target = float(np.clip(gripper_target, args.gripper_min, args.gripper_max))
+                now_t = time.time()
+                if now_t - last_gripper_command_t >= 1.0 / args.gripper_command_hz:
+                    last_gripper_ret = robot.command_gripper(gripper_target)
+                    if last_gripper_ret not in (None, 0):
+                        print(
+                            "[joy-teleop] WARNING: set_gripper_position failed "
+                            f"ret={last_gripper_ret}, target={gripper_target:.1f}"
+                        )
+                    last_gripper_command_t = now_t
+                if now_t - last_gripper_log_t > 0.5:
+                    direction = "close" if gripper_delta < 0 else "open"
+                    actual_gripper = robot.read_gripper()
+                    limit_note = ""
+                    if gripper_target <= args.gripper_min + 1e-3:
+                        limit_note = " min-limit"
+                    elif gripper_target >= args.gripper_max - 1e-3:
+                        limit_note = " max-limit"
+                    print(
+                        f"[joy-teleop] gripper {direction} "
+                        f"target={gripper_target:.1f} actual={actual_gripper:.1f} "
+                        f"ret={last_gripper_ret}{limit_note}"
+                    )
+                    last_gripper_log_t = now_t
 
             target_pose7[6] = gripper_target
             target_pose7 = clamp_target_pose(target_pose7, args)
@@ -899,9 +1027,11 @@ def teleop_loop(args, robot: XArm6ServoCartesian, cameras: dict[str, RealSenseCa
             elapsed = time.time() - t0
             if elapsed < control_dt:
                 time.sleep(control_dt - elapsed)
-        if return_home_on_exit and not discard_episode:
+        if return_home_on_exit:
             target_pose7 = return_to_initial_pose(robot, target_pose7, initial_pose7, args)
     finally:
+        if old_terminal_attrs is not None:
+            termios.tcsetattr(sys.stdin, termios.TCSADRAIN, old_terminal_attrs)
         pad.close()
         if discard_episode and dataset is not None:
             dataset.clear_episode_buffer()
@@ -957,7 +1087,32 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--rot-gain-deg", type=float, default=25.0, help="deg/s at full stick deflection")
     ap.add_argument("--servo-speed", type=float, default=100.0)
     ap.add_argument("--servo-acc", type=float, default=1000.0)
-    ap.add_argument("--return-home-seconds", type=float, default=3.0, help="seconds used to return to the initial pose after Enter")
+    ap.add_argument("--return-home-seconds", type=float, default=3.0, help="seconds used for Cartesian return modes")
+    ap.add_argument(
+        "--return-home-mode",
+        choices=["joint-home", "cartesian-start", "cartesian-fixed"],
+        default="joint-home",
+        help="Enter/Esc return target. joint-home uses the PPO HOME_QPOS joint pose.",
+    )
+    ap.add_argument(
+        "--home-qpos-rad",
+        nargs=6,
+        type=float,
+        default=PPO_HOME_QPOS_RAD.tolist(),
+        metavar=("J1", "J2", "J3", "J4", "J5", "J6"),
+        help="joint home used by --return-home-mode joint-home, in radians",
+    )
+    ap.add_argument("--return-home-joint-speed", type=float, default=0.35, help="joint-home return speed in rad/s")
+    ap.add_argument("--return-home-joint-acc", type=float, default=2.0, help="joint-home return acceleration in rad/s^2")
+    ap.add_argument("--home-gripper", type=float, default=None, help="optional gripper target after joint-home return")
+    ap.add_argument(
+        "--initial-pose7",
+        nargs=7,
+        type=float,
+        default=None,
+        metavar=("X", "Y", "Z", "ROLL", "PITCH", "YAW", "GRIPPER"),
+        help="fixed TCP xyz/rpy/gripper target used by --return-home-mode cartesian-fixed",
+    )
 
     ap.add_argument("--x-sign", type=float, default=-1.0)
     ap.add_argument("--y-sign", type=float, default=-1.0)
@@ -968,7 +1123,8 @@ def parse_args() -> argparse.Namespace:
 
     ap.add_argument("--z-up-button", type=int, default=BTN_LB)
     ap.add_argument("--yaw-pos-button", type=int, default=BTN_RB)
-    ap.add_argument("--gripper-toggle-button", type=int, default=BTN_A)
+    ap.add_argument("--gripper-close-button", type=int, default=BTN_Y)
+    ap.add_argument("--gripper-open-button", type=int, default=BTN_X)
     ap.add_argument("--save-button", type=int, default=BTN_SELECT)
     ap.add_argument("--emergency-button", type=int, default=BTN_START)
     ap.add_argument("--discard-on-emergency", action=argparse.BooleanOptionalAction, default=True)
@@ -977,6 +1133,8 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--enable-gripper", action=argparse.BooleanOptionalAction, default=True)
     ap.add_argument("--gripper-min", type=float, default=0.0)
     ap.add_argument("--gripper-max", type=float, default=850.0)
+    ap.add_argument("--gripper-rate", type=float, default=300.0, help="gripper position units per second while holding open/close buttons")
+    ap.add_argument("--gripper-command-hz", type=float, default=15.0, help="max gripper set_position command rate while holding open/close buttons")
     ap.add_argument("--gripper-speed", type=int, default=5000)
 
     ap.add_argument("--collision-sensitivity", type=int, default=1)
@@ -987,6 +1145,13 @@ def parse_args() -> argparse.Namespace:
     args = ap.parse_args()
     args.rot_gain_rad = math.radians(args.rot_gain_deg)
     args.camera_format = "bgr8"
+    args.home_qpos_rad = np.asarray(args.home_qpos_rad, dtype=np.float32)
+    if args.gripper_command_hz <= 0:
+        ap.error("--gripper-command-hz must be positive")
+    if args.return_home_mode == "cartesian-fixed" and args.initial_pose7 is None:
+        ap.error("--initial-pose7 is required when --return-home-mode=cartesian-fixed")
+    if args.initial_pose7 is not None and args.return_home_mode != "cartesian-fixed":
+        args.return_home_mode = "cartesian-fixed"
     try:
         apply_task_root(args)
     except ValueError as exc:
