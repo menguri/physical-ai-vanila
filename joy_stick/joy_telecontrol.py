@@ -16,6 +16,8 @@ import argparse
 import errno
 import math
 import os
+import select
+import shutil
 import struct
 import sys
 import time
@@ -68,6 +70,54 @@ def import_required(module_name: str, install_hint: str):
         return __import__(module_name)
     except ImportError as exc:
         raise SystemExit(f"{module_name} is not installed. {install_hint}") from exc
+
+
+def move_incomplete_lerobot_root(root: Path) -> Path | None:
+    """Move aside a LeRobot root created by create() before any episode was saved."""
+    if not root.exists():
+        return None
+
+    info_path = root / "meta" / "info.json"
+    episode_meta_dir = root / "meta" / "episodes"
+    tasks_path = root / "meta" / "tasks.parquet"
+    data_dir = root / "data"
+    videos_dir = root / "videos"
+    images_dir = root / "images"
+    is_empty = not any(root.iterdir())
+    has_saved_episode_metadata = episode_meta_dir.exists() or tasks_path.exists()
+    has_saved_episode_payload = data_dir.exists() or videos_dir.exists()
+    has_only_temporary_images = images_dir.exists() and not has_saved_episode_metadata and not has_saved_episode_payload
+    is_unsaved_lerobot_root = info_path.exists() and not has_saved_episode_metadata and not has_saved_episode_payload
+    if not is_empty and not is_unsaved_lerobot_root and not has_only_temporary_images:
+        return None
+
+    stamp = time.strftime("%Y%m%d-%H%M%S")
+    backup = root.with_name(f"{root.name}.partial-{stamp}")
+    suffix = 1
+    while backup.exists():
+        backup = root.with_name(f"{root.name}.partial-{stamp}-{suffix}")
+        suffix += 1
+
+    shutil.move(str(root), str(backup))
+    return backup
+
+
+def sanitize_task_id(task_id: str) -> str:
+    sanitized = "".join(ch if ch.isalnum() or ch in ("-", "_") else "_" for ch in task_id.strip())
+    sanitized = sanitized.strip("._-")
+    if not sanitized:
+        raise ValueError("--task-id must contain at least one letter or number")
+    return sanitized
+
+
+def apply_task_root(args: argparse.Namespace) -> None:
+    if not args.task_id:
+        return
+
+    task_id = sanitize_task_id(args.task_id)
+    base_root = Path(args.root) if args.root is not None else Path("data")
+    args.root = str(base_root if base_root.name == task_id else base_root / task_id)
+    args.task_id = task_id
 
 
 def clip(v: float, lo: float, hi: float) -> float:
@@ -169,6 +219,27 @@ class Gamepad:
 def make_lerobot_dataset(args):
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
+    if args.action_mode == "delta":
+        action_names = [
+            "delta_tcp_x_mm",
+            "delta_tcp_y_mm",
+            "delta_tcp_z_mm",
+            "delta_tcp_roll_rad",
+            "delta_tcp_pitch_rad",
+            "delta_tcp_yaw_rad",
+            "delta_gripper_pos",
+        ]
+    else:
+        action_names = [
+            "target_tcp_x_mm",
+            "target_tcp_y_mm",
+            "target_tcp_z_mm",
+            "target_tcp_roll_rad",
+            "target_tcp_pitch_rad",
+            "target_tcp_yaw_rad",
+            "target_gripper_pos",
+        ]
+
     features = {
         "observation.images.wrist": {
             "dtype": "video",
@@ -191,21 +262,37 @@ def make_lerobot_dataset(args):
         "action": {
             "dtype": "float32",
             "shape": (7,),
-            "names": [
-                "target_tcp_x_mm",
-                "target_tcp_y_mm",
-                "target_tcp_z_mm",
-                "target_tcp_roll_rad",
-                "target_tcp_pitch_rad",
-                "target_tcp_yaw_rad",
-                "target_gripper_pos",
-            ],
+            "names": action_names,
         },
     }
 
-    return LeRobotDataset.create(
+    root = Path(args.root) if args.root is not None else None
+    if root is not None and root.exists():
+        backup = move_incomplete_lerobot_root(root)
+        if backup is not None:
+            print(f"[joy-teleop] moved incomplete dataset stub to {backup}")
+        else:
+            dataset = LeRobotDataset(
+                repo_id=args.repo_id,
+                root=root,
+                batch_encoding_size=1,
+                streaming_encoding=args.streaming_encoding,
+            )
+            if args.image_writer_processes or args.image_writer_threads:
+                dataset.start_image_writer(
+                    num_processes=args.image_writer_processes,
+                    num_threads=args.image_writer_threads,
+                )
+            print(
+                "[joy-teleop] resuming dataset "
+                f"{root} ({dataset.meta.total_episodes} episodes, {dataset.meta.total_frames} frames, "
+                f"next EP{dataset.meta.total_episodes + 1})"
+            )
+            return dataset
+
+    dataset = LeRobotDataset.create(
         repo_id=args.repo_id,
-        root=args.root,
+        root=root,
         fps=args.fps,
         robot_type="xarm6",
         features=features,
@@ -214,6 +301,8 @@ def make_lerobot_dataset(args):
         image_writer_processes=args.image_writer_processes,
         streaming_encoding=args.streaming_encoding,
     )
+    print(f"[joy-teleop] created dataset {dataset.root} (next EP1)")
+    return dataset
 
 
 class WristRealSense:
@@ -222,16 +311,30 @@ class WristRealSense:
         self.cv2 = import_required("cv2", "pip install opencv-python")
         self.width = width
         self.height = height
+        self.fps = fps
+        self.serial = serial
         self.pipeline = self.rs.pipeline()
         self.config = self.rs.config()
         if serial:
             self.config.enable_device(serial)
         self.config.enable_stream(self.rs.stream.color, width, height, self.rs.format.bgr8, fps)
+        self.started = False
 
     def start(self) -> None:
-        self.pipeline.start(self.config)
-        for _ in range(10):
-            self.pipeline.wait_for_frames()
+        serial_msg = self.serial if self.serial else "auto"
+        try:
+            self.pipeline.start(self.config)
+            self.started = True
+            for _ in range(10):
+                self.pipeline.wait_for_frames()
+        except Exception as exc:
+            if self.started:
+                self.pipeline.stop()
+                self.started = False
+            raise RuntimeError(
+                "Failed to start RealSense camera "
+                f"(serial={serial_msg}, stream={self.width}x{self.height}@{self.fps}): {exc}"
+            ) from exc
 
     def get_latest_rgb(self) -> np.ndarray:
         frames = self.pipeline.wait_for_frames()
@@ -242,7 +345,10 @@ class WristRealSense:
         return self.cv2.cvtColor(color_bgr, self.cv2.COLOR_BGR2RGB)
 
     def stop(self) -> None:
+        if not self.started:
+            return
         self.pipeline.stop()
+        self.started = False
 
 
 class XArm6ServoCartesian:
@@ -375,6 +481,65 @@ def button_edge(pad: Gamepad, button: int, previous: bool) -> tuple[bool, bool]:
     return current and not previous, current
 
 
+def enter_pressed() -> bool:
+    if not sys.stdin.isatty():
+        return False
+    readable, _, _ = select.select([sys.stdin], [], [], 0)
+    if not readable:
+        return False
+    sys.stdin.readline()
+    return True
+
+
+def dataset_has_pending_frames(dataset) -> bool:
+    episode_buffer = getattr(dataset, "episode_buffer", None)
+    if not episode_buffer:
+        return False
+    return int(episode_buffer.get("size", 0)) > 0
+
+
+def save_pending_dataset(dataset) -> None:
+    if dataset_has_pending_frames(dataset):
+        dataset.save_episode()
+
+
+def return_to_initial_pose(
+    robot: XArm6ServoCartesian,
+    current_pose7: np.ndarray,
+    initial_pose7: np.ndarray,
+    args,
+) -> np.ndarray:
+    print("[joy-teleop] returning to initial state...")
+    start = current_pose7.copy()
+    goal = clamp_target_pose(initial_pose7, args)
+    delta = goal - start
+    delta[3:6] = ((delta[3:6] + math.pi) % (2.0 * math.pi)) - math.pi
+
+    steps = max(2, int(args.return_home_seconds * args.control_hz))
+    dt = 1.0 / args.control_hz
+    for i in range(1, steps + 1):
+        alpha = i / steps
+        pose = start + alpha * delta
+        pose = clamp_target_pose(pose, args)
+        ret = robot.send_target_pose(pose, speed=args.servo_speed, acc=args.servo_acc)
+        if ret != 0:
+            raise RuntimeError(f"return to initial state failed: ret={ret}, target={pose.tolist()}")
+        time.sleep(dt)
+
+    robot.command_gripper(float(goal[6]))
+    print("[joy-teleop] returned to initial state.")
+    return goal
+
+
+def record_action_from_target(state7: np.ndarray, target_pose7: np.ndarray, action_mode: str) -> np.ndarray:
+    if action_mode == "absolute":
+        return target_pose7.astype(np.float32).copy()
+
+    action7 = target_pose7.astype(np.float32) - state7.astype(np.float32)
+    action7[3:6] = ((action7[3:6] + math.pi) % (2.0 * math.pi)) - math.pi
+    return action7
+
+
 def teleop_loop(args, robot: XArm6ServoCartesian, camera: WristRealSense | None, dataset) -> None:
     pad = Gamepad(args.device)
     pad.settle()
@@ -383,10 +548,12 @@ def teleop_loop(args, robot: XArm6ServoCartesian, camera: WristRealSense | None,
     record_dt = 1.0 / args.fps
     next_record_t = time.time()
 
-    target_pose7 = robot.read_state()
+    initial_pose7 = robot.read_state()
+    target_pose7 = initial_pose7.copy()
     gripper_target = float(target_pose7[6])
     previous_gripper_button = False
     discard_episode = False
+    return_home_on_exit = False
 
     print("[joy-teleop] running")
     print(f"  device : {pad.name} ({args.device})")
@@ -396,6 +563,7 @@ def teleop_loop(args, robot: XArm6ServoCartesian, camera: WristRealSense | None,
     print("  RB / RT     : TCP yaw + / -")
     print("  A           : toggle gripper")
     print("  SELECT      : save and exit")
+    print("  Enter       : save, return to initial state, and exit")
     print("  START       : emergency stop and discard episode")
     print("  Ctrl+C      : save and exit")
 
@@ -406,6 +574,11 @@ def teleop_loop(args, robot: XArm6ServoCartesian, camera: WristRealSense | None,
 
             if pad.button(args.save_button):
                 print("[joy-teleop] save button pressed.")
+                break
+
+            if enter_pressed():
+                print("[joy-teleop] Enter pressed; save, return to initial state, and exit.")
+                return_home_on_exit = True
                 break
 
             if pad.button(args.emergency_button):
@@ -443,7 +616,7 @@ def teleop_loop(args, robot: XArm6ServoCartesian, camera: WristRealSense | None,
                     raise RuntimeError("camera is required when dataset is enabled")
                 wrist_rgb = camera.get_latest_rgb()
                 state7 = robot.read_state()
-                action7 = target_pose7.copy()
+                action7 = record_action_from_target(state7, target_pose7, args.action_mode)
                 dataset.add_frame(
                     {
                         "observation.images.wrist": wrist_rgb,
@@ -457,6 +630,8 @@ def teleop_loop(args, robot: XArm6ServoCartesian, camera: WristRealSense | None,
             elapsed = time.time() - t0
             if elapsed < control_dt:
                 time.sleep(control_dt - elapsed)
+        if return_home_on_exit and not discard_episode:
+            target_pose7 = return_to_initial_pose(robot, target_pose7, initial_pose7, args)
     finally:
         pad.close()
         if discard_episode and dataset is not None:
@@ -471,8 +646,15 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--fps", type=int, default=10, help="LeRobot recording FPS")
     ap.add_argument("--control-hz", type=float, default=100.0, help="xArm servo Cartesian loop rate")
     ap.add_argument("--record", action="store_true", help="record one episode in LeRobot v3 format")
+    ap.add_argument(
+        "--action-mode",
+        choices=["delta", "absolute"],
+        default="delta",
+        help="Action saved in dataset: delta from observation.state or absolute target TCP 7D.",
+    )
     ap.add_argument("--repo-id", default=None, help="Hugging Face dataset repo id")
     ap.add_argument("--root", default=None, help="local LeRobot dataset root")
+    ap.add_argument("--task-id", default=None, help="folder name under --root for this task, e.g. TASK1 -> ./data/TASK1")
     ap.add_argument("--task", default="teleoperate xarm6 with joystick", help="task string saved with each frame")
 
     ap.add_argument("--width", type=int, default=640)
@@ -489,6 +671,7 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--rot-gain-deg", type=float, default=25.0, help="deg/s at full stick deflection")
     ap.add_argument("--servo-speed", type=float, default=100.0)
     ap.add_argument("--servo-acc", type=float, default=1000.0)
+    ap.add_argument("--return-home-seconds", type=float, default=3.0, help="seconds used to return to the initial pose after Enter")
 
     ap.add_argument("--x-sign", type=float, default=-1.0)
     ap.add_argument("--y-sign", type=float, default=-1.0)
@@ -517,6 +700,10 @@ def parse_args() -> argparse.Namespace:
 
     args = ap.parse_args()
     args.rot_gain_rad = math.radians(args.rot_gain_deg)
+    try:
+        apply_task_root(args)
+    except ValueError as exc:
+        ap.error(str(exc))
 
     if args.record and not args.repo_id:
         ap.error("--repo-id is required when --record is set")
@@ -550,8 +737,7 @@ def main() -> None:
         if camera is not None:
             camera.stop()
         if dataset is not None:
-            if dataset.has_pending_frames():
-                dataset.save_episode()
+            save_pending_dataset(dataset)
             dataset.finalize()
             print(f"[joy-teleop] LeRobot dataset finalized at {dataset.root}")
 

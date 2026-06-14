@@ -1,264 +1,240 @@
-# xArm6 RL + LeRobot Data Collection
+# physical-ai-vanila
 
-MuJoCo 시뮬레이션에서 xArm6 reach 정책을 학습하고, 학습된 정책을 실제 UFactory xArm6에 배포하며, SpaceMouse로 VLA fine-tuning용 LeRobot 포맷 데이터를 수집하는 프로젝트입니다.
+`physical-ai-vanila`는 xArm6 real robot에서 VLA fine-tuning용 LeRobot 데이터를 수집하고, 학습된 VLA checkpoint를 실제 로봇에서 평가하기 위한 작업 repo입니다.
 
-## 구성
+주요 흐름은 다음과 같습니다.
+
+1. 로봇 PC에서 joystick + RealSense로 xArm6 demonstration 데이터를 수집합니다.
+2. 수집된 LeRobot dataset을 SSH 서버로 동기화합니다.
+3. SSH 서버에서 LeRobot async policy server를 띄웁니다.
+4. 로봇 PC는 SSH tunnel을 통해 policy server에 observation을 보내고 action chunk를 받아 실행합니다.
+
+MuJoCo PPO/SAC 학습 코드는 보조 기능으로만 유지합니다. 관련 내용은 [xarm_rl/README.md](xarm_rl/README.md)를 보세요.
+
+## Repo 구조
 
 ```text
 physical-ai-vanila/
-  assets/
-    xarm6/                 # xArm6 MJCF/URDF/mesh
-    scene_reach.xml
-    scene_pick_place.xml
-  xarm_rl/
-    envs/
-      base_env.py
-      reach_env.py         # XArm6Reach-v0
-      pick_place_env.py
+  joy_stick/
+    joy_telecontrol_serial.py   # xArm6 teleop + LeRobot dataset recording
   scripts/
-    train.py               # PPO/SAC 학습
-    eval_headless.py       # headless 평가
-    render_gif.py          # 시뮬 rollout GIF 생성
-    demo_grid_tour.py      # 시뮬 9-point grid tour GIF 생성
-    deploy_grid_tour.py    # 실제 xArm6 9-point grid tour 배포
-    deploy_real.py         # 단일 target 실제 배포
-  space_mouse/
-    space_telecontrol.py   # SpaceMouse teleop + LeRobot 기록
-  outputs/
-    reach_ppo_v2/          # PPO baseline 결과
-    real_runs/             # 실제 실행 로그
+    vla_xarm_client.py          # remote VLA policy server client for real xArm6 eval
+    camera_ready.py             # RealSense quick check
+    diag_servo.py               # xArm servo sanity check
+    train.py, eval_headless.py  # legacy/support xarm_rl experiments
+  sh_scripts/
+    env.sh                      # shared local config
+    00_check_robot.sh
+    10_collect_delta_dataset.sh
+    20_sync_data_to_ssh.sh
+    30_remote_policy_server.sh
+    40_open_policy_tunnel.sh
+    50_vla_no_motion.sh
+    60_vla_real_eval.sh
+  xarm_rl/                      # optional MuJoCo PPO/SAC envs
+  data/                         # local LeRobot datasets
+  outputs/                      # diagnostics, old RL outputs, reports
 ```
 
-## 설치
+긴 명령은 되도록 `sh_scripts/`에 넣었습니다. 먼저 [sh_scripts/env.sh](sh_scripts/env.sh)를 열어서 robot IP, camera serial, task, model path, port를 현재 실험에 맞게 수정하세요.
 
-Windows에서 현재 폴더 구조를 기준으로:
+## 설치와 기본 확인
 
-```powershell
-cd C:\Users\M207\Desktop\kang\code_factory\physical-ai-vanila
+로봇 PC에서:
 
-uv venv physical-ai-vanila\.venv --python 3.11
-.\physical-ai-vanila\.venv\Scripts\activate
-
-uv pip install -e '.\physical-ai-vanila[real]'
-uv pip install pyspacemouse pyrealsense2 opencv-python lerobot
+```bash
+cd /home/mlic/data_collection/physical-ai-vanila
+source .venv/bin/activate
+pip install -e ".[real]"
+pip install pyrealsense2 opencv-python grpcio lerobot
 ```
 
-학습/평가만 할 때는 `pyspacemouse`, `pyrealsense2`, `opencv-python`, `lerobot`가 없어도 됩니다. 실제 로봇 배포에는 `xArm-Python-SDK`, SpaceMouse 데이터 수집에는 위 네 패키지가 필요합니다.
+로봇과 카메라 확인:
 
-설치 확인:
-
-```powershell
-cd C:\Users\M207\Desktop\kang\code_factory\physical-ai-vanila\physical-ai-vanila
-
-python -c "import mujoco, gymnasium, stable_baselines3, xarm_rl; import gymnasium as gym; e=gym.make('XArm6Reach-v0'); print('env OK', e.reset(seed=0)[0].shape)"
+```bash
+./sh_scripts/00_check_robot.sh
 ```
 
-`env OK (21,)`가 나오면 시뮬 환경은 정상입니다.
+기본 xArm controller IP는 `192.168.1.199`입니다. 바뀌면 [sh_scripts/env.sh](sh_scripts/env.sh)의 `ROBOT_IP`를 수정합니다.
 
-## 학습
+실제 로봇 실행 전에는 항상 xArm Studio에서 motor enable, error clear, home pose, e-stop 위치를 확인합니다.
 
-Reach 정책 학습:
+## 데이터 수집
 
-```powershell
-python scripts/train.py --task reach --algo ppo `
-  --n_envs 16 `
-  --timesteps 1500000 `
-  --seed 7 `
-  --out outputs/reach_ppo_v2
-```
-
-SAC로 학습:
-
-```powershell
-python scripts/train.py --task reach --algo sac `
-  --n_envs 1 `
-  --timesteps 250000 `
-  --seed 23 `
-  --out outputs/reach_sac_v3
-```
-
-출력 구조:
+데이터 수집은 [joy_stick/joy_telecontrol_serial.py](joy_stick/joy_telecontrol_serial.py)를 사용합니다. 기본 action contract는 `delta`입니다.
 
 ```text
-outputs/reach_ppo_v2/
-  final_model.zip
-  ckpts/
-  monitor.csv
-  tb/
+observation.images.wrist   RGB video
+observation.images.front   RGB video, front camera를 켠 경우
+observation.state          float32[7], current TCP xyz/rpy + gripper
+action                     float32[7], target - observation.state
+task                       language instruction
 ```
 
-TensorBoard:
-
-```powershell
-tensorboard --logdir outputs
-```
-
-## 평가
-
-Headless 평가:
-
-```powershell
-python scripts/eval_headless.py --task reach --algo ppo `
-  --model outputs/reach_ppo_v2/final_model.zip `
-  --episodes 50 `
-  --out_json outputs/reach_ppo_v2/eval.json
-```
-
-평가 JSON에는 다음 값이 저장됩니다.
+`action`의 순서와 단위:
 
 ```text
-success_rate
-mean_reward
-mean_final_dist
-mean_ep_len
+delta_tcp_x_mm
+delta_tcp_y_mm
+delta_tcp_z_mm
+delta_tcp_roll_rad
+delta_tcp_pitch_rad
+delta_tcp_yaw_rad
+delta_gripper_pos
 ```
 
-현재 확인된 기준 성능:
+수집 시작:
 
-| 정책 | 결과 |
-|---|---:|
-| PPO v2 baseline | 86% success |
-| SAC v3 best | 86% success |
-| PPO v2 9-point grid tour | 9/9 target 도달 |
-
-## 시뮬 GIF
-
-9-point grid tour GIF 생성:
-
-```powershell
-python scripts/demo_grid_tour.py --algo ppo `
-  --model outputs/reach_ppo_v2/final_model.zip `
-  --out outputs/gif/ppo_v2_grid_tour.gif
+```bash
+./sh_scripts/10_collect_delta_dataset.sh
 ```
 
-단일 rollout GIF 생성:
+조작 중 `SELECT`는 episode 저장 후 종료, `START`는 emergency stop 후 episode buffer 폐기입니다. `Enter`는 저장 후 초기 pose로 복귀하고 종료합니다.
 
-```powershell
-python scripts/render_gif.py --task reach --algo ppo `
-  --model outputs/reach_ppo_v2/final_model.zip `
-  --out outputs/gif/ppo_v2_rollout.gif `
-  --episodes 3 `
-  --width 480 `
-  --height 360 `
-  --fps 30
-```
+기존 absolute target action 데이터셋에 delta episode를 이어 붙이지 마세요. action 의미가 섞이지 않도록 새 `DATA_ROOT` 또는 `TASK_ID`로 수집합니다.
 
-시뮬 결과:
+## Dataset 트리
 
-![PPO grid tour](outputs/gif/ppo_v2_grid_tour_small.gif)
-
-| PPO v2 rollout | SAC v3 best rollout |
-|---|---|
-| ![ppo](outputs/gif/ppo_v2_rollout.gif) | ![sac](outputs/gif/sac_v3_rollout_best.gif) |
-
-## 실제 배포
-
-실제 xArm6 실행 전 체크:
-
-- xArm6 controller와 노트북이 같은 네트워크에 있어야 합니다.
-- 기본 controller IP는 `192.168.1.199`입니다.
-- e-stop을 손에 두고 실행합니다.
-- xArm Studio에서 모터 enable, error clear, home 이동이 되는지 먼저 확인합니다.
-- workspace safety box는 `x: 0~570 mm`, `y: -540~550 mm`, `z: 180~600 mm` 기준으로 맞춥니다.
-
-통신 확인:
-
-```powershell
-python -c "from xarm.wrapper import XArmAPI; a=XArmAPI('192.168.1.199'); print('state=', a.get_state()); print('err_warn=', a.get_err_warn_code()); print('q=', a.get_servo_angle(is_radian=True)); a.disconnect()"
-```
-
-실제 9-point grid tour dry-run:
-
-```powershell
-python scripts/deploy_grid_tour.py `
-  --model outputs/reach_ppo_v2/final_model.zip `
-  --dry-run
-```
-
-실제 xArm6 실행:
-
-```powershell
-python scripts/deploy_grid_tour.py `
-  --model outputs/reach_ppo_v2/final_model.zip `
-  --home-speed 0.15 `
-  --max-step-rad 0.005 `
-  --dwell 2.0
-```
-
-처음 실제 실행은 `--max-step-rad 0.005`처럼 느리게 시작하고, 안정적으로 확인한 뒤 단계적으로 올립니다.
-
-실제 배포 GIF:
-
-![real xArm6 grid tour](outputs/gif/xarm-real-ppo.gif)
-
-## SpaceMouse로 LeRobot 데이터 수집
-
-`space_mouse/space_telecontrol.py`는 기존 RL 학습/배포 코드와 독립적으로 동작합니다.
-
-동작 방식:
-
-- `--record` 없음: SpaceMouse로 xArm Cartesian velocity 조종만 수행
-- `--record` 있음: 같은 루프에서 RealSense wrist RGB, 현재 TCP state, target action을 LeRobotDataset에 저장
-
-조종만:
-
-```powershell
-python space_mouse/space_telecontrol.py `
-  --ip 192.168.1.199 `
-  --fps 10
-```
-
-조종 + LeRobot 포맷 기록:
-
-```powershell
-python space_mouse/space_telecontrol.py `
-  --ip 192.168.1.199 `
-  --fps 10 `
-  --record `
-  --repo-id kangkang9412/xarm6_spacemouse_demo `
-  --root ./data/xarm6_spacemouse_demo `
-  --task "pick up the object"
-```
-
-`--fps 10`은 로봇 조종 속도가 아니라 데이터 저장 주기입니다. 기본 조종 루프는 `--control-hz 30`이라 SpaceMouse 입력과 xArm velocity command는 초당 30회 처리되고, LeRobot frame만 초당 10회 저장됩니다.
-
-저장 feature:
+LeRobot dataset은 대략 다음 구조로 생성됩니다.
 
 ```text
-observation.images.wrist   RGB video, uint8, 480x640x3
-observation.state          float32[7], current TCP 6D pose + gripper
-action                     float32[7], target TCP 6D pose + gripper
-task                       add_frame()에 같이 전달되는 task string
+data/xarm6_delta_demo/
+  data/
+    chunk-000/
+      file-000.parquet
+      file-001.parquet
+  videos/
+    observation.images.wrist/
+      chunk-000/
+        file-000.mp4
+    observation.images.front/
+      chunk-000/
+        file-000.mp4
+  meta/
+    info.json
+    stats.json
+    tasks.parquet
+    episodes/
+      chunk-000/
+        file-000.parquet
 ```
 
-종료:
+VLA fine-tuning에서는 `observation.state`, `observation.images.*`, `task`를 input으로 쓰고 `action`을 예측 대상으로 씁니다. delta로 수집한 checkpoint는 real eval에서도 `--action-mode delta`로 실행해야 합니다.
 
-- `q` 또는 Ctrl+C: 현재 episode 저장 후 `finalize()`
-- `Esc`: 현재 episode buffer 폐기
+## SSH 서버로 데이터 보내기
 
-`lerobot` repo는 inner 프로젝트 안에 넣을 필요가 없습니다. 현재처럼 sibling으로 두면 `space_telecontrol.py`가 `..\lerobot\src`를 먼저 사용하고, 없으면 `.venv`에 설치된 `lerobot` 패키지를 사용합니다.
+수집이 끝나면 로봇 PC에서:
+
+```bash
+./sh_scripts/20_sync_data_to_ssh.sh
+```
+
+기본 동기화 위치는 다음과 같습니다.
 
 ```text
-C:\Users\M207\Desktop\kang\code_factory\physical-ai-vanila\
-  lerobot\
-  physical-ai-vanila\
-    space_mouse\
-      space_telecontrol.py
+local : physical-ai-vanila/data
+remote: 10server:/home/mlic/mingukang/lerobot/collected_demo/data
 ```
 
-## 트러블슈팅
+필요하면 [sh_scripts/env.sh](sh_scripts/env.sh)의 `REMOTE`, `REMOTE_DATA_BASE`를 수정합니다.
+
+## Remote VLA inference
+
+### 1. 모델 등록
+
+로봇 PC의 [sh_scripts/env.sh](sh_scripts/env.sh)에서 inference할 checkpoint를 등록합니다.
+
+```bash
+POLICY_TYPE=pi05
+POLICY_PATH=/home/mlic/mingukang/lerobot/outputs/train/pi05_real_full_wandb_20260612_160420/checkpoints/025000/pretrained_model
+ACTION_MODE=delta
+LOCAL_POLICY_PORT=8080
+```
+
+`POLICY_PATH`는 로봇 PC 경로가 아니라 SSH 서버 filesystem의 checkpoint 경로입니다. `POLICY_TYPE`과 checkpoint 종류가 맞아야 합니다. 예를 들어 PI0.5 checkpoint는 `pi05`, SmolVLA checkpoint는 `smolvla`입니다.
+
+서버에서 별도 venv/conda 활성화가 필요하면 `REMOTE_SETUP`에 넣습니다.
+
+```bash
+REMOTE_SETUP="source .venv/bin/activate &&"
+```
+
+### 2. SSH 서버에서 policy server 실행
+
+`10server`에 LeRobot 환경이 준비되어 있다면 로봇 PC에서 다음 스크립트로 policy server를 띄웁니다.
+
+```bash
+./sh_scripts/30_remote_policy_server.sh
+```
+
+서버는 처음에는 빈 policy server입니다. 로봇 PC client가 handshake할 때 `POLICY_TYPE`과 `POLICY_PATH`를 보내고, 서버가 자기 디스크에서 checkpoint를 로드합니다.
+
+### 3. 로봇 PC에서 tunnel 열기
+
+다른 터미널에서:
+
+```bash
+./sh_scripts/40_open_policy_tunnel.sh
+```
+
+기본 연결은 다음과 같습니다.
+
+```text
+robot PC 127.0.0.1:8080 -> 10server 127.0.0.1:8080
+```
+
+포트 번호는 반드시 client와 tunnel이 같아야 합니다. `LOCAL_POLICY_PORT=8080`이면 client도 `127.0.0.1:8080`을 사용합니다. 8080이 이미 사용 중이면 [sh_scripts/env.sh](sh_scripts/env.sh)에서 `LOCAL_POLICY_PORT=18080`으로 바꾸고 tunnel과 client를 둘 다 같은 설정으로 실행합니다.
+
+포트가 꼬였을 때:
+
+```bash
+fuser -v 8080/tcp 18080/tcp
+fuser -k 8080/tcp 18080/tcp
+```
+
+### 4. no-motion 1차 테스트
+
+실제 로봇을 움직이기 전에 항상 no-motion 진단을 먼저 돌립니다.
+
+```bash
+./sh_scripts/50_vla_no_motion.sh
+```
+
+이 단계에서 확인할 것:
+
+- policy server handshake가 되는지
+- checkpoint가 서버에서 로드되는지
+- RealSense image와 `observation.state`가 정상인지
+- action 값이 demo action range와 크게 어긋나지 않는지
+- delta checkpoint는 `ACTION_MODE=delta`로 실행되는지
+
+### 5. 실제 로봇 eval
+
+no-motion에서 action이 정상 출력될 때만 실제 실행합니다.
+
+```bash
+./sh_scripts/60_vla_real_eval.sh
+```
+
+처음에는 [sh_scripts/env.sh](sh_scripts/env.sh)의 step limiter를 작게 두고 시작합니다.
+
+```bash
+MAX_POS_STEP_MM=2
+MAX_ROT_STEP_RAD=0.015
+MAX_GRIPPER_STEP=30
+SERVO_SPEED=20
+SERVO_ACC=150
+```
+
+안정적으로 확인한 뒤 천천히 올립니다.
+
+## Troubleshooting
 
 | 증상 | 확인 |
 |---|---|
-| `ModuleNotFoundError` | `.venv` 활성화 후 설치 명령 재실행 |
-| RealSense frame 없음 | USB 연결, Intel RealSense SDK, `pyrealsense2` 설치 확인 |
-| SpaceMouse open 실패 | SpaceMouse USB 연결과 3Dconnexion 드라이버 상태 확인 |
-| xArm code != 0 | xArm Studio에서 error clear 후 재실행 |
-| 실제 동작이 빠름 | `--max-step-rad`, `--home-speed`를 낮춤 |
-| MuJoCo headless render 실패 | `MUJOCO_GL=egl` 환경 변수 확인 |
-
-## Credits
-
-- xArm Python SDK: UFactory [xArm-Python-SDK](https://github.com/xArm-Developer/xArm-Python-SDK)
-- RL: [Stable-Baselines3](https://stable-baselines3.readthedocs.io/), [Gymnasium](https://gymnasium.farama.org/), [MuJoCo](https://mujoco.org/)
-- Dataset format: [LeRobot](https://github.com/huggingface/lerobot)
+| `Address already in use` | local tunnel port가 이미 사용 중입니다. `fuser -v 8080/tcp 18080/tcp`로 확인합니다. |
+| `timed out before receiving SETTINGS frame` | tunnel은 열렸지만 remote `127.0.0.1:8080`이 LeRobot gRPC policy server가 아닐 수 있습니다. 서버 쪽 policy server를 확인합니다. |
+| `'PI05Config' object has no attribute 'vlm_model_name'` | PI0.5 checkpoint를 `smolvla`로 로드한 경우입니다. `POLICY_TYPE=pi05`로 맞춥니다. |
+| `VIDIOC_S_FMT errno=16 Device or resource busy` | 이전 client나 RealSense Viewer가 카메라를 잡고 있습니다. `fuser -v /dev/video*`로 확인합니다. |
+| RealSense serial 없음 | `./sh_scripts/00_check_robot.sh`로 연결 serial을 확인하고 `env.sh`를 수정합니다. |
+| xArm error code | xArm Studio에서 error clear 후 재시도합니다. |
