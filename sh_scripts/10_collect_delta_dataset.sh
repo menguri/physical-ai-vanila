@@ -38,7 +38,7 @@ python joy_stick/joy_telecontrol_serial.py \
   --wrist-camera-serial "${WRIST_CAMERA_SERIAL}" \
   --image-writer-threads 4 \
   --image-writer-processes 0 \
-  --action-mode "${ACTION_MODE}" \
+  --action-mode "${DATA_ACTION_MODE}" \
   --deadzone 0.10 \
   --trigger-deadzone 0.05 \
   --pos-gain 80 \
@@ -46,7 +46,7 @@ python joy_stick/joy_telecontrol_serial.py \
   --servo-speed 35 \
   --servo-acc 300 \
   --gripper-rate 300 \
-  --gripper-command-hz 15 \
+  --gripper-command-hz 8 \
   --gripper-close-button 3 \
   --gripper-open-button 2 \
   --gripper-min 0 \
@@ -65,3 +65,9 @@ python joy_stick/joy_telecontrol_serial.py \
   --collision-sensitivity 1 \
   --return-home-seconds 5 \
   "${EXTRA_ARGS[@]}"
+
+
+# TASK_ID=TASK1 \
+# TASK="pick up the bottle with the white cap and place it in the dark brown box" \
+# FPS=10 \
+# ./sh_scripts/10_collect_delta_dataset.sh

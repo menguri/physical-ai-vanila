@@ -18,6 +18,7 @@ TASK="${TASK:-pick up the white bottle and place it in the dark brown box}"
 DATA_ROOT="${DATA_ROOT:-${PROJECT_ROOT}/data/xarm6_delta_demo}"
 REPO_ID="${REPO_ID:-kangkang9412/xarm6_delta_demo}"
 TASK_ID="${TASK_ID:-TASK_DELTA}"
+DATA_ACTION_MODE="${DATA_ACTION_MODE:-both}"
 ACTION_MODE="${ACTION_MODE:-delta}"
 FPS="${FPS:-10}"
 
