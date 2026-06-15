@@ -1066,10 +1066,20 @@ def teleop_loop(args, robot: XArm6ServoCartesian, cameras: dict[str, RealSenseCa
             if close_held != previous_close_held:
                 state = "pressed" if close_held else "released"
                 print(f"[joy-teleop] gripper close button {state} (button={args.gripper_close_button})")
+                if close_held:
+                    gripper_target = float(np.clip(robot.read_gripper(), args.gripper_min, args.gripper_max))
+                    target_pose7[6] = gripper_target
+                    last_gripper_command_t = 0.0
+                    print(f"[joy-teleop] gripper target synced to actual: {gripper_target:.1f}")
                 previous_close_held = close_held
             if open_held != previous_open_held:
                 state = "pressed" if open_held else "released"
                 print(f"[joy-teleop] gripper open button {state} (button={args.gripper_open_button})")
+                if open_held:
+                    gripper_target = float(np.clip(robot.read_gripper(), args.gripper_min, args.gripper_max))
+                    target_pose7[6] = gripper_target
+                    last_gripper_command_t = 0.0
+                    print(f"[joy-teleop] gripper target synced to actual: {gripper_target:.1f}")
                 previous_open_held = open_held
 
             gripper_delta = 0.0
