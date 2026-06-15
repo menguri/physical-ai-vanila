@@ -38,7 +38,7 @@ python joy_stick/joy_telecontrol_serial.py \
   --wrist-camera-serial "${WRIST_CAMERA_SERIAL}" \
   --image-writer-threads 4 \
   --image-writer-processes 0 \
-  --action-mode "${ACTION_MODE}" \
+  --action-mode "${DATA_ACTION_MODE}" \
   --deadzone 0.10 \
   --trigger-deadzone 0.05 \
   --pos-gain 80 \

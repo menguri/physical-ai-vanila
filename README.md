@@ -39,7 +39,8 @@ vim sh_scripts/env.sh
 | `DATA_ROOT` | local LeRobot dataset 저장 root |
 | `REPO_ID` | LeRobot dataset repo id |
 | `TASK_ID` | dataset task folder |
-| `ACTION_MODE` | 기본 `delta` |
+| `DATA_ACTION_MODE` | demo collection action 저장 방식, 기본 `both` |
+| `ACTION_MODE` | real eval action 실행 방식, 기본 `delta` |
 | `FPS` | 수집/eval FPS |
 | `REMOTE` | SSH alias, 기본 `10server` |
 | `REMOTE_LEROBOT_ROOT` | SSH 서버의 LeRobot repo 경로 |
@@ -57,6 +58,7 @@ vim sh_scripts/env.sh
 TASK="pick up the white bottle and place it in the dark brown box"
 TASK_ID="TASK_DELTA"
 DATA_ROOT="${PROJECT_ROOT}/data/xarm6_delta_demo"
+DATA_ACTION_MODE=both
 
 POLICY_TYPE=pi05
 POLICY_PATH=/home/mlic/mingukang/lerobot/outputs/train/pi05_real_full_wandb_20260612_160420/checkpoints/025000/pretrained_model
@@ -149,13 +151,14 @@ HOME_QPOS_RAD = [0.0, -0.3, -1.2, 0.0, 1.5, 0.0]
 
 ### Action Contract
 
-기본 `ACTION_MODE`는 `delta`입니다.
+demo collection의 기본 `DATA_ACTION_MODE`는 `both`입니다. 이때 `action`에는 delta 7DoF가 저장되고, `action.absolute`에는 absolute target 7DoF가 함께 저장됩니다.
 
 ```text
 observation.images.wrist   RGB video
 observation.images.front   RGB video, front camera enabled
 observation.state          float32[7], current TCP xyz/rpy + gripper
 action                     float32[7], target - observation.state
+action.absolute            float32[7], target TCP xyz/rpy + gripper
 task                       language instruction
 ```
 
@@ -171,7 +174,29 @@ delta_tcp_yaw_rad
 delta_gripper_pos
 ```
 
-기존 absolute action dataset에 delta episode를 섞지 않습니다. 새 `DATA_ROOT` 또는 `TASK_ID`로 분리해서 수집합니다.
+`action.absolute` 순서와 단위:
+
+```text
+target_tcp_x_mm
+target_tcp_y_mm
+target_tcp_z_mm
+target_tcp_roll_rad
+target_tcp_pitch_rad
+target_tcp_yaw_rad
+target_gripper_pos
+```
+
+한쪽만 저장하고 싶을 때만 [10_collect_delta_dataset.sh](sh_scripts/10_collect_delta_dataset.sh) 실행 전에 `DATA_ACTION_MODE=delta` 또는 `DATA_ACTION_MODE=absolute`를 지정합니다. `absolute`만 저장하면 `action` 필드 자체가 absolute target이 됩니다.
+
+기존 action schema와 다른 dataset에는 episode를 섞지 않습니다. 기존 `meta/info.json`에 `action.absolute`가 없는데 `DATA_ACTION_MODE=both`로 이어붙이거나, 반대로 `both` dataset에 `delta`/`absolute`만 이어붙이려고 하면 수집을 시작하지 않고 에러를 냅니다. 다른 schema는 새 `DATA_ROOT` 또는 `TASK_ID`로 분리합니다.
+
+같은 `TASK_ID`로 이어서 수집할 때 instruction이 섞이지 않도록, dataset root 아래에 `task_instruction.txt`를 저장합니다.
+
+```text
+data/xarm6_delta_demo/TASK_DELTA/task_instruction.txt
+```
+
+이미 존재하는 task folder에 다시 수집할 경우, 이 파일의 instruction과 현재 `TASK`가 다르면 수집을 시작하지 않고 에러를 냅니다. 다른 instruction은 새 `TASK_ID` 또는 새 `DATA_ROOT`로 분리합니다.
 
 ### Dataset
 
@@ -179,23 +204,25 @@ LeRobot dataset은 대략 다음 구조로 생성됩니다.
 
 ```text
 data/xarm6_delta_demo/
-  data/
-    chunk-000/
-      file-000.parquet
-  videos/
-    observation.images.wrist/
-      chunk-000/
-        file-000.mp4
-    observation.images.front/
-      chunk-000/
-        file-000.mp4
-  meta/
-    info.json
-    stats.json
-    tasks.parquet
-    episodes/
+  TASK_DELTA/
+    task_instruction.txt
+    data/
       chunk-000/
         file-000.parquet
+    videos/
+      observation.images.wrist/
+        chunk-000/
+          file-000.mp4
+      observation.images.front/
+        chunk-000/
+          file-000.mp4
+    meta/
+      info.json
+      stats.json
+      tasks.parquet
+      episodes/
+        chunk-000/
+          file-000.parquet
 ```
 
 VLA fine-tuning에서는 `observation.state`, `observation.images.*`, `task`를 input으로 쓰고 `action`을 예측 대상으로 씁니다.

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import argparse
 import errno
+import json
 import math
 import os
 import select
@@ -77,6 +78,7 @@ JS_EVENT_INIT = 0x80
 
 # PPO home joint pose used by xarm_rl/envs/base_env.py and real deploy scripts.
 PPO_HOME_QPOS_RAD = np.array([0.0, -0.3, -1.2, 0.0, 1.5, 0.0], dtype=np.float32)
+TASK_INSTRUCTION_FILENAME = "task_instruction.txt"
 
 
 def import_required(module_name: str, install_hint: str):
@@ -246,6 +248,90 @@ def apply_task_root(args: argparse.Namespace) -> None:
     args.task_id = task_id
 
 
+def normalize_instruction(text: str) -> str:
+    return " ".join(text.strip().split())
+
+
+def validate_or_write_task_instruction(root: Path | None, task: str) -> None:
+    if root is None:
+        return
+
+    instruction_path = root / TASK_INSTRUCTION_FILENAME
+    current = normalize_instruction(task)
+    if not current:
+        raise ValueError("task instruction is empty")
+
+    if instruction_path.exists():
+        expected = normalize_instruction(instruction_path.read_text(encoding="utf-8"))
+        if expected != current:
+            raise ValueError(
+                "Task instruction mismatch for existing dataset root.\n"
+                f"  root: {root}\n"
+                f"  saved in {TASK_INSTRUCTION_FILENAME}: {expected!r}\n"
+                f"  current --task: {current!r}\n"
+                "Use the matching instruction, or choose a new TASK_ID/DATA_ROOT for a different task."
+            )
+        print(f"[joy-teleop] task instruction matched: {instruction_path}")
+        return
+
+    root.mkdir(parents=True, exist_ok=True)
+    instruction_path.write_text(current + "\n", encoding="utf-8")
+    print(f"[joy-teleop] wrote task instruction: {instruction_path}")
+
+
+def validate_existing_task_instruction(root: Path | None, task: str) -> None:
+    if root is None:
+        return
+    instruction_path = root / TASK_INSTRUCTION_FILENAME
+    if not instruction_path.exists():
+        return
+
+    expected = normalize_instruction(instruction_path.read_text(encoding="utf-8"))
+    current = normalize_instruction(task)
+    if expected != current:
+        raise ValueError(
+            "Task instruction mismatch for existing dataset root.\n"
+            f"  root: {root}\n"
+            f"  saved in {TASK_INSTRUCTION_FILENAME}: {expected!r}\n"
+            f"  current --task: {current!r}\n"
+            "Use the matching instruction, or choose a new TASK_ID/DATA_ROOT for a different task."
+        )
+
+
+def existing_dataset_feature_keys(root: Path | None) -> set[str]:
+    if root is None:
+        return set()
+    info_path = root / "meta" / "info.json"
+    if not info_path.exists():
+        return set()
+    try:
+        info = json.loads(info_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return set()
+    features = info.get("features")
+    return set(features) if isinstance(features, dict) else set()
+
+
+def validate_existing_action_schema(root: Path | None, action_mode: str) -> None:
+    keys = existing_dataset_feature_keys(root)
+    if not keys:
+        return
+
+    has_absolute_extra = "action.absolute" in keys
+    if action_mode == "both" and not has_absolute_extra:
+        raise ValueError(
+            "Existing dataset root does not contain 'action.absolute', but current --action-mode is 'both'.\n"
+            f"  root: {root}\n"
+            "Use DATA_ACTION_MODE=delta for this existing dataset, or choose a new TASK_ID/DATA_ROOT."
+        )
+    if action_mode != "both" and has_absolute_extra:
+        raise ValueError(
+            "Existing dataset root contains 'action.absolute', so it was created with --action-mode=both.\n"
+            f"  root: {root}\n"
+            "Use DATA_ACTION_MODE=both for this existing dataset, or choose a new TASK_ID/DATA_ROOT."
+        )
+
+
 def clip(v: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, v))
 
@@ -345,26 +431,25 @@ class Gamepad:
 def make_lerobot_dataset(args):
     from lerobot.datasets.lerobot_dataset import LeRobotDataset
 
-    if args.action_mode == "delta":
-        action_names = [
-            "delta_tcp_x_mm",
-            "delta_tcp_y_mm",
-            "delta_tcp_z_mm",
-            "delta_tcp_roll_rad",
-            "delta_tcp_pitch_rad",
-            "delta_tcp_yaw_rad",
-            "delta_gripper_pos",
-        ]
-    else:
-        action_names = [
-            "target_tcp_x_mm",
-            "target_tcp_y_mm",
-            "target_tcp_z_mm",
-            "target_tcp_roll_rad",
-            "target_tcp_pitch_rad",
-            "target_tcp_yaw_rad",
-            "target_gripper_pos",
-        ]
+    delta_action_names = [
+        "delta_tcp_x_mm",
+        "delta_tcp_y_mm",
+        "delta_tcp_z_mm",
+        "delta_tcp_roll_rad",
+        "delta_tcp_pitch_rad",
+        "delta_tcp_yaw_rad",
+        "delta_gripper_pos",
+    ]
+    absolute_action_names = [
+        "target_tcp_x_mm",
+        "target_tcp_y_mm",
+        "target_tcp_z_mm",
+        "target_tcp_roll_rad",
+        "target_tcp_pitch_rad",
+        "target_tcp_yaw_rad",
+        "target_gripper_pos",
+    ]
+    primary_action_names = absolute_action_names if args.action_mode == "absolute" else delta_action_names
 
     features = {
         "observation.images.wrist": {
@@ -388,9 +473,16 @@ def make_lerobot_dataset(args):
         "action": {
             "dtype": "float32",
             "shape": (7,),
-            "names": action_names,
+            "names": primary_action_names,
         },
     }
+
+    if args.action_mode == "both":
+        features["action.absolute"] = {
+            "dtype": "float32",
+            "shape": (7,),
+            "names": absolute_action_names,
+        }
 
     if args.use_front_camera:
         features["observation.images.front"] = {
@@ -405,6 +497,7 @@ def make_lerobot_dataset(args):
         if backup is not None:
             print(f"[joy-teleop] moved incomplete dataset stub to {backup}")
         else:
+            validate_or_write_task_instruction(root, args.task)
             dataset = LeRobotDataset(
                 repo_id=args.repo_id,
                 root=root,
@@ -434,6 +527,7 @@ def make_lerobot_dataset(args):
         image_writer_processes=args.image_writer_processes,
         streaming_encoding=args.streaming_encoding,
     )
+    validate_or_write_task_instruction(Path(dataset.root), args.task)
     print(f"[joy-teleop] created dataset {dataset.root} (next EP1)")
     return dataset
 
@@ -813,6 +907,11 @@ def read_keyboard_key() -> str | None:
     return sys.stdin.read(1)
 
 
+def enter_pressed() -> bool:
+    key = read_keyboard_key()
+    return key in ("\n", "\r")
+
+
 def dataset_has_pending_frames(dataset) -> bool:
     episode_buffer = getattr(dataset, "episode_buffer", None)
     if not episode_buffer:
@@ -868,13 +967,24 @@ def return_to_initial_pose(
     return goal
 
 
-def record_action_from_target(state7: np.ndarray, target_pose7: np.ndarray, action_mode: str) -> np.ndarray:
-    if action_mode == "absolute":
-        return target_pose7.astype(np.float32).copy()
-
+def record_delta_action_from_target(state7: np.ndarray, target_pose7: np.ndarray) -> np.ndarray:
     action7 = target_pose7.astype(np.float32) - state7.astype(np.float32)
     action7[3:6] = ((action7[3:6] + math.pi) % (2.0 * math.pi)) - math.pi
     return action7
+
+
+def record_absolute_action_from_target(target_pose7: np.ndarray) -> np.ndarray:
+    return target_pose7.astype(np.float32).copy()
+
+
+def add_action_fields(frame: dict, state7: np.ndarray, target_pose7: np.ndarray, action_mode: str) -> None:
+    if action_mode == "absolute":
+        frame["action"] = record_absolute_action_from_target(target_pose7).astype(np.float32)
+        return
+
+    frame["action"] = record_delta_action_from_target(state7, target_pose7).astype(np.float32)
+    if action_mode == "both":
+        frame["action.absolute"] = record_absolute_action_from_target(target_pose7).astype(np.float32)
 
 
 def teleop_loop(args, robot: XArm6ServoCartesian, cameras: dict[str, RealSenseCamera] | None, dataset) -> None:
@@ -1010,13 +1120,12 @@ def teleop_loop(args, robot: XArm6ServoCartesian, cameras: dict[str, RealSenseCa
                     raise RuntimeError("wrist camera is required when dataset is enabled")
                 wrist_rgb = cameras["wrist"].get_latest_rgb()
                 state7 = robot.read_state()
-                action7 = record_action_from_target(state7, target_pose7, args.action_mode)
                 frame = {
                     "observation.images.wrist": wrist_rgb,
                     "observation.state": state7.astype(np.float32),
-                    "action": action7.astype(np.float32),
                     "task": args.task,
                 }
+                add_action_fields(frame, state7, target_pose7, args.action_mode)
                 if args.use_front_camera:
                     if "front" not in cameras:
                         raise RuntimeError("front camera is enabled but not available")
@@ -1047,9 +1156,12 @@ def parse_args() -> argparse.Namespace:
     ap.add_argument("--record", action="store_true", help="record one episode in LeRobot v3 format")
     ap.add_argument(
         "--action-mode",
-        choices=["delta", "absolute"],
-        default="delta",
-        help="Action saved in dataset: delta from observation.state or absolute target TCP 7D.",
+        choices=["both", "delta", "absolute"],
+        default="both",
+        help=(
+            "Action saved in dataset. both stores delta in 'action' and absolute target in "
+            "'action.absolute'; delta/absolute store only that mode in 'action'."
+        ),
     )
     ap.add_argument("--repo-id", default=None, help="Hugging Face dataset repo id")
     ap.add_argument("--root", default=None, help="local LeRobot dataset root")
@@ -1167,6 +1279,13 @@ def parse_args() -> argparse.Namespace:
 
     if args.record and not args.repo_id:
         ap.error("--repo-id is required when --record is set")
+    if args.record:
+        try:
+            dataset_root = Path(args.root) if args.root is not None else None
+            validate_existing_task_instruction(dataset_root, args.task)
+            validate_existing_action_schema(dataset_root, args.action_mode)
+        except ValueError as exc:
+            ap.error(str(exc))
     if args.record and not args.wrist_camera_serial:
         ap.error("--wrist-camera-serial/--camera-serial is required when --record is set")
     if args.use_front_camera and not args.front_camera_serial:
