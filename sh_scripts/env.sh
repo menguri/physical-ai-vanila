@@ -14,7 +14,7 @@ FRONT_CAMERA_SERIAL="${FRONT_CAMERA_SERIAL:-261222078861}"
 USE_FRONT_CAMERA="${USE_FRONT_CAMERA:-1}"
 
 # Data collection.
-TASK="${TASK:-pick up the white bottle and place it in the dark brown box}"
+TASK="${TASK:-pick up the yellow pencil sharpener and place it on the cardboard box}"
 DATA_ROOT="${DATA_ROOT:-${PROJECT_ROOT}/data/xarm6_delta_demo}"
 REPO_ID="${REPO_ID:-kangkang9412/xarm6_delta_demo}"
 TASK_ID="${TASK_ID:-TASK_DELTA}"
@@ -25,10 +25,11 @@ FPS="${FPS:-10}"
 # SSH / remote policy server.
 REMOTE="${REMOTE:-10server}"
 REMOTE_LEROBOT_ROOT="${REMOTE_LEROBOT_ROOT:-/home/mlic/mingukang/lerobot}"
+REMOTE_LEROBOT_CHECKOUT="${REMOTE_LEROBOT_CHECKOUT:-spacemouse-lerobot-recording}"
 REMOTE_DATA_BASE="${REMOTE_DATA_BASE:-/home/mlic/mingukang/lerobot/collected_demo}"
 REMOTE_SETUP="${REMOTE_SETUP:-}"
 REMOTE_POLICY_PORT="${REMOTE_POLICY_PORT:-8080}"
-LOCAL_POLICY_PORT="${LOCAL_POLICY_PORT:-8080}"
+LOCAL_POLICY_PORT="${LOCAL_POLICY_PORT:-18080}"
 
 # Inference checkpoint on the SSH server filesystem.
 POLICY_TYPE="${POLICY_TYPE:-pi05}"

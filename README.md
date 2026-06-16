@@ -25,7 +25,7 @@ vim sh_scripts/env.sh
 
 ## Config
 
-연구원이 보통 바꾸는 값은 [sh_scripts/env.sh](sh_scripts/env.sh)에만 둡니다. joystick sign, deadzone, camera resolution, servo gain, safety clamp, gripper button 같은 실행 디테일은 각 script 안에 고정되어 있습니다.
+연구원이 보통 바꾸는 공통 값은 [sh_scripts/env.sh](sh_scripts/env.sh)에 둡니다. 데이터 수집 때 자주 바꾸는 `TASK_ID`, `TASK`, `FPS`는 [sh_scripts/10_collect_delta_dataset.sh](sh_scripts/10_collect_delta_dataset.sh) 상단에서도 바로 지정할 수 있습니다. joystick sign, deadzone, camera resolution, servo gain, safety clamp, gripper button 같은 실행 디테일은 각 script 안에 고정되어 있습니다.
 
 자주 바꾸는 값:
 
@@ -44,6 +44,7 @@ vim sh_scripts/env.sh
 | `FPS` | 수집/eval FPS |
 | `REMOTE` | SSH alias, 기본 `10server` |
 | `REMOTE_LEROBOT_ROOT` | SSH 서버의 LeRobot repo 경로 |
+| `REMOTE_LEROBOT_CHECKOUT` | SSH 서버의 LeRobot checkout 이름, 비우면 현재 checkout 사용 |
 | `REMOTE_DATA_BASE` | 수집 데이터가 복사될 SSH 서버 경로 |
 | `REMOTE_SETUP` | 서버 venv/conda 활성화 명령 |
 | `REMOTE_POLICY_PORT` | SSH 서버 policy server port |
@@ -55,14 +56,15 @@ vim sh_scripts/env.sh
 예시:
 
 ```bash
-TASK="pick up the white bottle and place it in the dark brown box"
+TASK="pick up the yellow pencil sharpener and place it on the cardboard box"
 TASK_ID="TASK_DELTA"
 DATA_ROOT="${PROJECT_ROOT}/data/xarm6_delta_demo"
 DATA_ACTION_MODE=both
 
 POLICY_TYPE=pi05
 POLICY_PATH=/home/mlic/mingukang/lerobot/outputs/train/pi05_real_full_wandb_20260612_160420/checkpoints/025000/pretrained_model
-LOCAL_POLICY_PORT=8080
+LOCAL_POLICY_PORT=18080
+REMOTE_POLICY_PORT=8080
 ```
 
 `POLICY_PATH`는 로봇 PC 경로가 아니라 SSH 서버에서 보이는 checkpoint 경로입니다.
@@ -96,6 +98,35 @@ pip install pyrealsense2 opencv-python grpcio lerobot
 수집은 이 스크립트로 실행합니다.
 
 ```bash
+./sh_scripts/10_collect_delta_dataset.sh
+```
+
+수집 instruction과 task folder를 매번 파일 안에서 관리하려면 [10_collect_delta_dataset.sh](sh_scripts/10_collect_delta_dataset.sh) 상단의 값을 수정합니다.
+
+```bash
+TASK_ID="${TASK_ID:-TASK1}"
+TASK="${TASK:-pick up the yellow pencil sharpener and place it on the cardboard box}"
+
+# TASK_ID="${TASK_ID:-TASK2}"
+# TASK="${TASK:-pick up the blue spray bottle and place it on the cardboard box}"
+
+# TASK_ID="${TASK_ID:-TASK3}"
+# TASK="${TASK:-pick up the wooden tea box and place it on the cardboard box}"
+
+# TASK_ID="${TASK_ID:-TASK4}"
+# TASK="${TASK:-pick up the black tape measure and place it on the cardboard box}"
+
+FPS="${FPS:-10}"
+```
+
+다른 task로 수집할 때는 현재 활성화된 `TASK_ID`/`TASK` 두 줄을 주석 처리하고, 원하는 task block의 주석을 풀면 됩니다. 같은 `TASK_ID`에 서로 다른 instruction을 섞지 않도록 task마다 `TASK_ID`를 분리합니다.
+
+실행할 때만 임시로 바꾸고 싶으면 환경변수로 override합니다. 이 값들이 script 안의 기본값보다 우선합니다.
+
+```bash
+TASK_ID=TASK1 \
+TASK="pick up the bottle with the white cap and place it in the dark brown box" \
+FPS=10 \
 ./sh_scripts/10_collect_delta_dataset.sh
 ```
 

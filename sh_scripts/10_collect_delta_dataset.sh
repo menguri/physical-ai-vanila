@@ -2,6 +2,24 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# Per-collection defaults. Edit these here for the usual case, or override them
+# at launch time, e.g. TASK_ID=TASK1 TASK="..." FPS=10 ./sh_scripts/10_collect_delta_dataset.sh
+# TASK_ID="${TASK_ID:-TASK1}"
+# TASK="${TASK:-pick up the yellow pencil sharpener and place it on the cardboard box}"
+
+TASK_ID="${TASK_ID:-TASK2}"
+TASK="${TASK:-pick up the blue spray bottle and place it on the cardboard box}"
+
+# TASK_ID="${TASK_ID:-TASK3}"
+# TASK="${TASK:-pick up the wooden tea box and place it on the cardboard box}"
+
+# TASK_ID="${TASK_ID:-TASK4}"
+# TASK="${TASK:-pick up the black tape measure and place it on the cardboard box}"
+
+
+FPS="${FPS:-10}"
+
 source "${SCRIPT_DIR}/env.sh"
 
 cd "${PROJECT_ROOT}"
